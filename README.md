@@ -1,6 +1,6 @@
 # ADA Checker
 
-A Rust desktop app (egui/eframe) that scans a web page for WCAG 2.2 compliance at Level A, AA, or AAA.
+A Rust desktop app (egui/eframe) with two tools. The **Accessibility Checker** scans a web page for WCAG 2.0, 2.1 or 2.2 compliance at Level A, AA or AAA. The **Link Checker** checks a pasted list of links and reports which ones are broken.
 
 ## Run
 
@@ -63,6 +63,38 @@ Either way, the results list expands the finding's rule and scrolls to the findi
 Badge clicks reach the app through wry's IPC channel as `select:<rule>:<finding>`. Scripts on the page can post to that channel too, so the app only accepts well-formed messages that refer to a real finding.
 
 You can also pass a URL on the command line to scan it when the app opens: `adachecker https://example.com`.
+
+## Link Checker
+
+Select **Link Checker** in the left-hand navigation. Paste a list of links into the left pane and press **Check N links** at the top of the pane. The results table on the right fills in as each link is checked. It shows:
+
+- the result
+- the HTTP status code, for example `200 OK` or `404 Not Found`
+- the redirect chain, when there is one
+- the response time
+
+What you can paste:
+
+- One link per line. Links without `https://`, like `example.org/page`, also work.
+- Links inside text, Markdown or HTML. The app picks them out.
+- Lines starting with `#`, which are ignored as comments.
+- Duplicate links, which are checked only once.
+
+| Result | Meaning |
+|---|---|
+| ✔ OK | 2xx response |
+| ↪ Redirected | Reached a 2xx response after one or more redirects. Details shows the chain, for example `301 → 200 → https://…` |
+| ⚠ Restricted | 401, 403, 407 or 429. The server refused an automated request, but the link may still work in a browser. |
+| ✖ Broken | Any other 4xx or 5xx response |
+| ✖ Error | No HTTP response, for example a DNS failure, a refused connection, a TLS error or a timeout |
+
+How links are checked:
+
+- Eight links are checked at a time, and **Stop** cancels the run.
+- Each link gets a `HEAD` request first, because it doesn't download the page. If that fails, the link is checked again with `GET` before it's reported as broken. Many servers mishandle `HEAD`.
+- Redirects are followed by the app itself, up to 10, so the whole chain can be shown.
+- **Show only problems** filters the table.
+- **Copy as CSV** copies the results for a spreadsheet.
 
 ## What it checks
 

@@ -1,5 +1,7 @@
 mod checks;
 mod code_view;
+mod link_checker_ui;
+mod links;
 mod preview;
 mod scanner;
 mod source;
@@ -7,6 +9,7 @@ mod source;
 use checks::{Level, Outcome, Severity, Version};
 use eframe::egui::{self, Color32, RichText};
 use code_view::{CodeView, Mark};
+use link_checker_ui::LinkChecker;
 use preview::Preview;
 use scanner::Report;
 use std::sync::mpsc::{channel, Receiver};
@@ -14,9 +17,9 @@ use std::sync::mpsc::{channel, Receiver};
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("ADA Checker — WCAG Compliance Scanner")
-            .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([900.0, 520.0]),
+            .with_title("ADA Checker")
+            .with_inner_size([1500.0, 900.0])
+            .with_min_inner_size([1000.0, 520.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -33,6 +36,13 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+/// The tools in the left-hand navigation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Accessibility,
+    Links,
 }
 
 /// Where a selection came from. Selecting in one view reveals the element in the other.
@@ -57,6 +67,8 @@ enum ScanState {
 }
 
 struct App {
+    tool: Tool,
+    link_checker: LinkChecker,
     url: String,
     version: Version,
     level: Level,
@@ -86,6 +98,22 @@ struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            // Debug builds only: ADA_TOOL=links opens the Link Checker, and ADA_LINKS_FILE=path
+            // pre-fills it from a file and starts checking (for testing).
+            tool: if cfg!(debug_assertions) && std::env::var("ADA_TOOL").as_deref() == Ok("links") {
+                Tool::Links
+            } else {
+                Tool::Accessibility
+            },
+            link_checker: {
+                let mut lc = LinkChecker::default();
+                if cfg!(debug_assertions) {
+                    if let Some(text) = std::env::var_os("ADA_LINKS_FILE").and_then(|p| std::fs::read_to_string(p).ok()) {
+                        lc.load(text, true);
+                    }
+                }
+                lc
+            },
             url: String::new(),
             // WCAG 2.1 AA is the standard referenced by the ADA Title II rule.
             version: Version::V2_1,
@@ -613,12 +641,52 @@ fn finding_row(ui: &mut egui::Ui, pal: &Palette, f: &checks::Finding, selected: 
     response
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        self.poll();
-        if std::mem::take(&mut self.scan_on_start) {
-            self.start_scan(ui.ctx());
+/// One entry in the left-hand navigation: a tab with a title and a short description.
+fn nav_tab(ui: &mut egui::Ui, selected: bool, title: &str, subtitle: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), egui::Sense::click());
+    let visuals = ui.style().interact_selectable(&resp, selected);
+    let painter = ui.painter();
+    painter.rect(rect, 6.0, visuals.weak_bg_fill, visuals.bg_stroke, egui::StrokeKind::Inside);
+    if selected {
+        let bar = egui::Rect::from_min_size(rect.min, egui::vec2(4.0, rect.height()));
+        painter.rect_filled(bar, 2.0, ui.visuals().selection.stroke.color);
+    }
+    let text = visuals.text_color();
+    painter.text(rect.left_top() + egui::vec2(14.0, 9.0), egui::Align2::LEFT_TOP, title, egui::FontId::proportional(15.0), text);
+    painter.text(rect.left_top() + egui::vec2(14.0, 30.0), egui::Align2::LEFT_TOP, subtitle, egui::FontId::proportional(12.0), text);
+    if resp.has_focus() {
+        painter.rect_stroke(rect.expand(1.0), 6.0, ui.visuals().selection.stroke, egui::StrokeKind::Outside);
+    }
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, format!("{title}. {subtitle}")));
+    resp
+}
+
+impl App {
+    fn nav(&mut self, ui: &mut egui::Ui) {
+        let pal = palette(ui.visuals().dark_mode);
+        ui.add_space(12.0);
+        ui.label(RichText::new("ADA Checker").size(20.0).strong());
+        ui.label(RichText::new("Web accessibility tools").small().color(pal.muted));
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+        for (tool, title, subtitle) in [
+            (Tool::Accessibility, "Accessibility Checker", "Scan a page for WCAG issues"),
+            (Tool::Links, "Link Checker", "Find broken links in a list"),
+        ] {
+            if nav_tab(ui, self.tool == tool, title, subtitle).clicked() {
+                self.tool = tool;
+            }
+            ui.add_space(4.0);
         }
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.add_space(8.0);
+            ui.label(RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION"))).small().color(pal.muted));
+        });
+    }
+
+    /// The Accessibility Checker tool (URL scanner, results, preview and source).
+    fn accessibility_ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         egui::Panel::top("controls").show(ui, |ui| {
             self.controls(ui);
             self.summary(ui);
@@ -672,6 +740,24 @@ impl eframe::App for App {
             self.preview.run_now_if_ready(
                 "setTimeout(function () { var b = document.querySelector('button.__ada_checker_marker'); if (b) b.click(); }, 1500);",
             );
+        }
+    }}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // Keep polling the scan so it completes even while another tool is shown.
+        self.poll();
+        if std::mem::take(&mut self.scan_on_start) {
+            self.start_scan(ui.ctx());
+        }
+        egui::Panel::left("nav").resizable(false).exact_size(210.0).show(ui, |ui| self.nav(ui));
+        match self.tool {
+            Tool::Accessibility => self.accessibility_ui(ui, frame),
+            Tool::Links => {
+                // The page preview is a native view drawn over egui; keep it out of the way.
+                self.preview.hide();
+                self.link_checker.ui(ui);
+            }
         }
     }
 }
