@@ -2,7 +2,7 @@
 
 A Rust desktop app (egui/eframe) with three tools:
 
-- The **Accessibility Checker** scans a web page for WCAG 2.0, 2.1 or 2.2 compliance at Level A, AA or AAA.
+- The **WCAG Scanner** scans a web page for WCAG 2.0, 2.1 or 2.2 compliance at Level A, AA or AAA.
 - The **Link Checker** checks a pasted list of links and reports which ones are broken.
 - **Sortsite Eval** opens a SortSite report exported to Excel, so you can browse its worksheets.
 
@@ -31,9 +31,18 @@ To install the app, drag it to `/Applications`. The bundle is built for the arch
 
 Enter a URL (the scheme is optional and defaults to `https://`) or an absolute local `.html` file path. Pick a WCAG version and level, then press **Scan** or Enter.
 
+## Links on the page
+
+After a scan, the results area has two tabs, **WCAG results** and **Links (N)**. The **Links** tab lists every link on the page in page order, showing each link's text and address. **Click a link to see where it is:** the page preview scrolls to it and outlines it, with a caption giving its text and address, and the HTML source jumps to its tag.
+
+Type in **Filter** to find a link by its text or address. The list works whether or not **Check links** is on:
+
+- **Check links on:** each link also shows its status (✖ Broken, ⚠ Review, ✔ OK or ↪ Redirected), the tab shows counts, and **Only problems** narrows the list. The WCAG tab shows a one-line summary with a **Show links** button.
+- **Check links off:** the Status column shows "—", except for in-page `#links`, which the scan always checks.
+
 ## Checking the page's links
 
-Tick **Check links**, next to **Preview**, to also check every link on the scanned page. The app remembers the setting between launches. The check runs in the background after the scan, and a **Links** section above the WCAG results shows its progress and counts.
+Tick **Check links**, next to **Preview**, to also check every link on the scanned page. The app remembers the setting between launches. The check runs in the background after the scan. Its progress and results appear in the **Links** tab, and as a summary on the WCAG tab.
 
 What gets checked:
 
@@ -48,9 +57,9 @@ How results are grouped:
 |---|---|
 | ✖ Broken | 4xx or 5xx, DNS or connection errors, or a missing anchor |
 | ⚠ Review | the server refused an automated check (401, 403, 407, 417, 429, 999), a timeout, or an anchor that couldn't be checked |
-| ✔ OK / ↪ Redirected | working; hidden unless you tick **Show working links** |
+| ✔ OK / ↪ Redirected | working |
 
-**Click a link in the list** to highlight that `<a>` element in the page preview and the HTML source. Broken links aren't a WCAG success criterion, so they don't affect the conformance verdict.
+Broken links aren't a WCAG success criterion, so they don't affect the conformance verdict.
 
 ## Page preview
 
@@ -123,7 +132,7 @@ How links are checked:
 
 ## Sortsite Eval
 
-Select **Sortsite Eval** in the left-hand navigation. It has two tabs, both in the main window:
+**Sortsite Eval** is at the top of the left-hand navigation, and the app opens on it. If you start the app with a URL (`adachecker https://…`), it opens on the WCAG Scanner and scans that page instead. It has two tabs, both in the main window:
 
 - **Open file:** press **Browse for Excel spreadsheet…** and choose a SortSite report that has been exported to Excel. The app reads `.xlsx`, `.xlsm`, `.xlsb`, `.xls` and `.ods` files, using [calamine](https://github.com/tafia/calamine). Once a file is open, this tab shows a summary of it. Click a worksheet in the summary to view it.
 - **Worksheets:** opens automatically when a file has loaded.
@@ -141,6 +150,14 @@ Select **Sortsite Eval** in the left-hand navigation. It has two tabs, both in t
   - **Click a row** to open a details pane that lists every column of that row in full. You can select and copy the text.
     - Use **Dock: Below | Right | Left** in the pane's header to choose where it appears, like a browser's developer tools. Drag the pane's edge to resize it.
     - The app remembers your choice and uses the same side next time, including after a restart. It's saved as soon as you change it, in `~/Library/Application Support/ADA-Checker/app.ron`. Only this setting is stored there.
+
+### Reopening the last spreadsheet
+
+Tick **Reopen the last spreadsheet when the app starts** on the **Open file** tab, and the spreadsheet you last worked on opens by itself each time ADA Checker starts. It loads in the background and is waiting on the **Worksheets** tab.
+
+- **Which file:** the one you last opened. Once your changes have been saved, it's the `-fixed` copy, so your statuses and notes come back with it.
+- **If it's been moved or deleted,** the tab says it couldn't be reopened.
+- **Where it's saved:** the setting and the file's location are kept in `~/Library/Application Support/ADA-Checker/app.ron`.
 
 ### Marking rows Fixed, On-Hold or N/A
 
@@ -180,7 +197,7 @@ Each row's details pane has a **Notes** box, under the Status buttons, for comme
 
 The details pane shows an **ADA Check** button beside the row's **URL** (the page SortSite reported the issue on). Clicking it:
 
-- switches to the **Accessibility Checker**
+- switches to the **WCAG Scanner**
 - scans that page with the WCAG version and level currently selected there
 
 Sortsite Eval keeps its place, so switching back returns you to the same worksheet, row and filter. If a scan is already running, the new one starts as soon as it finishes.

@@ -20,7 +20,11 @@ const DETAILS_SIDE_KEY: &str = "sortsite.details_side";
 use preview::Preview;
 use scanner::{link_status, LinkBucket, Report};
 
-/// Settings-file key for the Accessibility Checker's "Check links" toggle.
+/// Settings-file keys for Sortsite Eval's "reopen the last spreadsheet" option.
+const SORTSITE_REOPEN_KEY: &str = "sortsite.reopen_last";
+const SORTSITE_LAST_FILE_KEY: &str = "sortsite.last_file";
+
+/// Settings-file key for the WCAG Scanner's "Check links" toggle.
 const CHECK_LINKS_KEY: &str = "accessibility.check_links";
 use std::sync::mpsc::{channel, Receiver};
 
@@ -46,6 +50,9 @@ fn main() -> eframe::Result<()> {
             if let Some(v) = cc.storage.and_then(|s| s.get_string(CHECK_LINKS_KEY)) {
                 app.check_links = app.check_links || v == "true";
             }
+            let reopen = cc.storage.and_then(|s| s.get_string(SORTSITE_REOPEN_KEY)).is_some_and(|v| v == "true");
+            let last_file = cc.storage.and_then(|s| s.get_string(SORTSITE_LAST_FILE_KEY)).filter(|p| !p.is_empty()).map(std::path::PathBuf::from);
+            app.sortsite.restore_settings(reopen, last_file);
             // Debug builds only: ADA_CHOOSE_SIDE=right acts as if the user then picked that
             // dock side (applied after restoring, like a real click would be).
             if cfg!(debug_assertions) {
@@ -58,6 +65,10 @@ fn main() -> eframe::Result<()> {
             if let Some(url) = std::env::args().skip(1).find(|a| !a.starts_with("-psn")) {
                 app.url = url;
                 app.scan_on_start = true;
+                // A URL on the command line is scanned, so show the WCAG Scanner.
+                if std::env::var_os("ADA_TOOL").is_none() {
+                    app.tool = Tool::Accessibility;
+                }
             }
             Ok(Box::new(app))
         }),
@@ -78,6 +89,13 @@ enum Origin {
     List,
     Page,
     Source,
+}
+
+/// The tabs of the results area.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResultsTab {
+    Wcag,
+    Links,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -125,7 +143,10 @@ struct App {
     link_results: Vec<Option<links::CheckedLink>>,
     /// For each `report.links` entry, its index in `link_urls` (None for in-page links).
     link_index: Vec<Option<usize>>,
-    show_ok_links: bool,
+    /// Results area: the WCAG findings or the list of the page's links.
+    results_tab: ResultsTab,
+    link_filter: String,
+    links_only_problems: bool,
     /// Selected link (index into `report.links`).
     selected_link: Option<usize>,
     /// Debug builds only: ADA_SELECT_LINK=n selects page link n once the link check ends.
@@ -145,7 +166,8 @@ impl Default for App {
             tool: match std::env::var("ADA_TOOL").as_deref() {
                 Ok("links") if cfg!(debug_assertions) => Tool::Links,
                 Ok("sortsite") if cfg!(debug_assertions) => Tool::Sortsite,
-                _ => Tool::Accessibility,
+                // The app opens on Sortsite Eval.
+                _ => Tool::Sortsite,
             },
             // Debug builds only: ADA_XLSX=path opens that spreadsheet on launch (for testing).
             sortsite: {
@@ -225,7 +247,14 @@ impl Default for App {
             link_urls: Vec::new(),
             link_results: Vec::new(),
             link_index: Vec::new(),
-            show_ok_links: false,
+            // Debug builds only: ADA_RESULTS_TAB=links opens the Links tab.
+            results_tab: if cfg!(debug_assertions) && std::env::var("ADA_RESULTS_TAB").as_deref() == Ok("links") {
+                ResultsTab::Links
+            } else {
+                ResultsTab::Wcag
+            },
+            link_filter: String::new(),
+            links_only_problems: false,
             selected_link: None,
             debug_select_link: if cfg!(debug_assertions) { std::env::var("ADA_SELECT_LINK").ok().and_then(|v| v.parse().ok()) } else { None },
             selected: None,
@@ -368,11 +397,15 @@ impl App {
     fn select_link(&mut self, i: usize) {
         let ScanState::Done(report) = &self.state else { return };
         let Some(link) = report.links.get(i) else { return };
-        let checked = self.link_index.get(i).copied().flatten().and_then(|u| self.link_results.get(u)).and_then(|r| r.as_ref());
-        let (bucket, detail) = link_status(link, checked);
+        let status = self.page_link_status(report, i);
+        let name = if link.text.is_empty() { "(no link text)".to_string() } else { format!("“{}”", link.text) };
+        let message = match &status {
+            Some((_, detail)) => format!("Link {name} → {} ({detail})", link.url),
+            None => format!("Link {name} → {}", link.url),
+        };
         let finding = checks::Finding {
-            severity: if bucket == LinkBucket::Broken { Severity::Error } else { Severity::Warning },
-            message: format!("Link “{}” → {} ({detail})", link.text, link.url),
+            severity: if matches!(status, Some((LinkBucket::Broken, _))) { Severity::Error } else { Severity::Warning },
+            message,
             snippet: None,
             locator: Some(link.locator.clone()),
         };
@@ -383,96 +416,166 @@ impl App {
         self.show_preview = true;
     }
 
-    /// The "Links" section above the results: counts, progress, and the problem links.
-    /// Returns the link the user clicked.
-    fn links_section(&mut self, ui: &mut egui::Ui) -> Option<usize> {
-        let ScanState::Done(report) = &self.state else { return None };
-        if !self.check_links && !self.link_check_started() {
+    /// Status of page link `i`, or `None` while it can't be known (link checking is off and
+    /// it isn't an in-page link, which the scan checks itself).
+    fn page_link_status(&self, report: &Report, i: usize) -> Option<(LinkBucket, String)> {
+        let link = report.links.get(i)?;
+        if link.local_anchor.is_none() && !self.link_check_started() {
             return None;
         }
+        let checked = self.link_index.get(i).copied().flatten().and_then(|u| self.link_results.get(u)).and_then(|r| r.as_ref());
+        Some(link_status(link, checked))
+    }
+
+    /// One-line link-check summary on the WCAG tab. Returns true if "Show links" was clicked.
+    fn links_summary(&self, ui: &mut egui::Ui) -> bool {
+        let ScanState::Done(report) = &self.state else { return false };
         let pal = palette(ui.visuals().dark_mode);
-        let statuses: Vec<(LinkBucket, String)> = report
-            .links
-            .iter()
-            .enumerate()
-            .map(|(i, l)| {
-                let checked = self.link_index.get(i).copied().flatten().and_then(|u| self.link_results.get(u)).and_then(|r| r.as_ref());
-                link_status(l, checked)
-            })
-            .collect();
-        let count = |b: LinkBucket| statuses.iter().filter(|(x, _)| *x == b).count();
+        let buckets: Vec<LinkBucket> = (0..report.links.len()).filter_map(|i| self.page_link_status(report, i).map(|(b, _)| b)).collect();
+        let count = |b: LinkBucket| buckets.iter().filter(|x| **x == b).count();
         let (broken, review, pending) = (count(LinkBucket::Broken), count(LinkBucket::Review), count(LinkBucket::Pending));
-        let working = count(LinkBucket::Ok) + count(LinkBucket::Redirected);
-        let running = self.link_run.is_some();
-        let mut header = format!("LINKS  ·  {} on the page ({} addresses)", report.links.len(), self.link_urls.len());
-        if broken > 0 {
-            header.push_str(&format!("  —  {broken} broken"));
+        let (text, color) = if report.links.is_empty() {
+            ("Links: none on this page".to_string(), pal.muted)
+        } else if pending > 0 {
+            (format!("Links: checking… {pending} of {} left · {broken} broken so far", report.links.len()), pal.review)
+        } else if broken + review > 0 {
+            (format!("Links: {broken} broken · {review} to review (of {})", report.links.len()), if broken > 0 { pal.fail } else { pal.review })
+        } else {
+            (format!("Links: all {} working", report.links.len()), pal.pass)
+        };
+        let mut open = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(text).strong().color(color));
+            if !report.links.is_empty() && ui.small_button("Show links").clicked() {
+                open = true;
+            }
+        });
+        ui.add_space(4.0);
+        open
+    }
+
+    /// The Links tab: every link on the page, with its status when known. Returns the link
+    /// the user clicked (to show where it is on the page).
+    fn links_tab(&mut self, ui: &mut egui::Ui) -> Option<usize> {
+        let ScanState::Done(report) = &self.state else { return None };
+        let pal = palette(ui.visuals().dark_mode);
+        let statuses: Vec<Option<(LinkBucket, String)>> = (0..report.links.len()).map(|i| self.page_link_status(report, i)).collect();
+        let checking = self.link_run.is_some();
+        let started = self.link_check_started();
+        let addresses = {
+            let mut urls: Vec<&str> = report.links.iter().map(|l| l.url.as_str()).collect();
+            urls.sort_unstable();
+            urls.dedup();
+            urls.len()
+        };
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("{} links on this page ({addresses} addresses)", report.links.len())).strong());
+            if started && !checking {
+                let count = |b: LinkBucket| statuses.iter().filter(|s| matches!(s, Some((x, _)) if *x == b)).count();
+                ui.label(RichText::new(format!("✖ {} broken", count(LinkBucket::Broken))).color(pal.fail));
+                ui.label(RichText::new(format!("⚠ {} to review", count(LinkBucket::Review))).color(pal.review));
+                ui.label(RichText::new(format!("✔ {} working", count(LinkBucket::Ok) + count(LinkBucket::Redirected))).color(pal.pass));
+            }
+        });
+        if checking {
+            let total = statuses.len().max(1);
+            let done = total - statuses.iter().filter(|s| matches!(s, Some((LinkBucket::Pending, _)))).count();
+            ui.add(egui::ProgressBar::new(done as f32 / total as f32).text(format!("{done} of {total} links checked")));
         }
-        if review > 0 {
-            header.push_str(&format!("  ·  {review} to review"));
+        ui.horizontal(|ui| {
+            let label = ui.label("Filter:");
+            ui.add(egui::TextEdit::singleline(&mut self.link_filter).hint_text("link text or address").desired_width(240.0))
+                .labelled_by(label.id);
+            if !self.link_filter.is_empty() && ui.small_button("✖").on_hover_text("Clear filter").clicked() {
+                self.link_filter.clear();
+            }
+            if started {
+                ui.checkbox(&mut self.links_only_problems, "Only problems");
+            } else {
+                ui.label(RichText::new("Tick “Check links” above to test whether each link works.").small().color(pal.muted));
+            }
+        });
+        ui.label(RichText::new("Click a link to see where it is on the page and in the HTML source.").small().color(pal.muted));
+        ui.add_space(4.0);
+
+        if report.links.is_empty() {
+            ui.label(RichText::new("This page has no links.").color(pal.muted));
+            return None;
         }
-        if running {
-            header.push_str(&format!("  ·  checking… {} left", pending));
-        } else if broken == 0 && review == 0 && !report.links.is_empty() {
-            header.push_str("  —  all working");
+        let needle = self.link_filter.trim().to_lowercase();
+        let only_problems = started && self.links_only_problems;
+        let shown: Vec<usize> = (0..report.links.len())
+            .filter(|&i| {
+                let l = &report.links[i];
+                needle.is_empty() || l.text.to_lowercase().contains(&needle) || l.url.to_lowercase().contains(&needle)
+            })
+            .filter(|&i| !only_problems || matches!(statuses[i], Some((LinkBucket::Broken | LinkBucket::Review, _))))
+            .collect();
+        if shown.is_empty() {
+            ui.label(RichText::new("No links match.").color(pal.muted));
+            return None;
         }
-        let color = if broken > 0 { pal.fail } else if review > 0 || running { pal.review } else { pal.pass };
 
         let mut clicked = None;
-        egui::CollapsingHeader::new(RichText::new(header).strong().color(color))
-            .id_salt("page-links")
-            .default_open(true)
-            .show(ui, |ui| {
-                if report.links.is_empty() {
-                    ui.label(RichText::new("This page has no links to check.").color(pal.muted));
-                    return;
+        let row_h = ui.text_style_height(&egui::TextStyle::Body) + 8.0;
+        egui_extras::TableBuilder::new(ui)
+            .id_salt("page-links-table")
+            .striped(true)
+            .resizable(true)
+            .sense(egui::Sense::click())
+            .auto_shrink([false, false])
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(egui_extras::Column::exact(40.0))
+            .column(egui_extras::Column::initial(130.0).at_least(90.0).clip(true))
+            .column(egui_extras::Column::initial(230.0).at_least(100.0).clip(true))
+            .column(egui_extras::Column::remainder().at_least(150.0).clip(true))
+            .header(row_h, |mut h| {
+                for title in ["#", "Status", "Link text", "Address"] {
+                    h.col(|ui| {
+                        ui.strong(title);
+                    });
                 }
-                if running {
-                    let total = statuses.len().max(1);
-                    ui.add(egui::ProgressBar::new((total - pending) as f32 / total as f32).text(format!("{} of {} links checked", total - pending, total)));
-                }
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.show_ok_links, format!("Show working links ({working})"));
-                    ui.label(RichText::new("Click a link to find it in the page and the HTML source.").small().color(pal.muted));
-                });
-                let shown: Vec<usize> = (0..statuses.len())
-                    .filter(|&i| self.show_ok_links || !matches!(statuses[i].0, LinkBucket::Ok | LinkBucket::Redirected))
-                    .collect();
-                if shown.is_empty() {
-                    let msg = if running { "No problems found so far." } else { "No problem links." };
-                    ui.label(RichText::new(msg).color(pal.pass));
-                    return;
-                }
-                egui::ScrollArea::vertical().id_salt("page-links-list").max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for i in shown {
-                        let (bucket, detail) = &statuses[i];
-                        let link = &report.links[i];
-                        let (tag, c) = match bucket {
-                            LinkBucket::Broken => ("✖ Broken", pal.fail),
-                            LinkBucket::Review => ("⚠ Review", pal.review),
-                            LinkBucket::Ok => ("✔ OK", pal.pass),
-                            LinkBucket::Redirected => ("↪ Redirected", pal.pass),
-                            LinkBucket::Pending => ("… Checking", pal.muted),
+            })
+            .body(|body| {
+                body.rows(row_h, shown.len(), |mut row| {
+                    let i = shown[row.index()];
+                    let link = &report.links[i];
+                    row.set_selected(self.selected_link == Some(i));
+                    row.col(|ui| {
+                        ui.add(egui::Label::new(RichText::new((i + 1).to_string()).color(pal.muted)).selectable(false));
+                    });
+                    row.col(|ui| {
+                        let (tag, color, detail) = match &statuses[i] {
+                            Some((LinkBucket::Broken, d)) => ("✖ Broken", pal.fail, d.as_str()),
+                            Some((LinkBucket::Review, d)) => ("⚠ Review", pal.review, d.as_str()),
+                            Some((LinkBucket::Ok, d)) => ("✔ OK", pal.pass, d.as_str()),
+                            Some((LinkBucket::Redirected, d)) => ("↪ Redirected", pal.pass, d.as_str()),
+                            Some((LinkBucket::Pending, _)) => ("… Checking", pal.muted, ""),
+                            None => ("—", pal.muted, "Not checked"),
                         };
-                        let text_color = ui.visuals().text_color();
-                        let mut job = egui::text::LayoutJob::default();
-                        let font = egui::FontId::proportional(13.5);
-                        job.append(tag, 0.0, egui::TextFormat::simple(font.clone(), c));
-                        let name = if link.text.is_empty() { "(no link text)".to_string() } else { format!("“{}”", link.text) };
-                        job.append(&format!("   {name}"), 0.0, egui::TextFormat::simple(font.clone(), text_color));
-                        job.append(&format!("   {}", link.url), 0.0, egui::TextFormat::simple(font.clone(), pal.muted));
-                        job.append(&format!("   {detail}"), 0.0, egui::TextFormat::simple(font, c));
-                        if ui
-                            .selectable_label(self.selected_link == Some(i), job)
-                            .on_hover_text(format!("{name}\n{}\n{detail}", link.url))
-                            .clicked()
-                        {
-                            clicked = Some(i);
+                        let r = ui.add(egui::Label::new(RichText::new(tag).color(color)).selectable(false));
+                        if !detail.is_empty() {
+                            r.on_hover_text(detail);
                         }
+                    });
+                    row.col(|ui| {
+                        let text = if link.text.is_empty() {
+                            RichText::new("(no link text)").italics().color(pal.muted)
+                        } else {
+                            RichText::new(&link.text)
+                        };
+                        ui.add(egui::Label::new(text).truncate().selectable(false)).on_hover_text(&link.text);
+                    });
+                    row.col(|ui| {
+                        ui.add(egui::Label::new(RichText::new(&link.url).color(pal.muted)).truncate().selectable(false))
+                            .on_hover_text(&link.url);
+                    });
+                    if row.response().clicked() {
+                        clicked = Some(i);
                     }
                 });
             });
-        ui.add_space(4.0);
         clicked
     }
 
@@ -517,6 +620,7 @@ impl App {
             Origin::List => {}
         }
         if origin != Origin::List {
+            self.results_tab = ResultsTab::Wcag;
             match rule.outcome() {
                 Outcome::Fail => self.show_fail = true,
                 Outcome::Review => self.show_review = true,
@@ -920,9 +1024,30 @@ fn finding_row(ui: &mut egui::Ui, pal: &Palette, f: &checks::Finding, selected: 
     response
 }
 
+impl App {
+    fn save_sortsite_settings(&self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(SORTSITE_REOPEN_KEY, self.sortsite.reopen_last().to_string());
+        let last = self.sortsite.last_file().map(|p| p.display().to_string()).unwrap_or_default();
+        storage.set_string(SORTSITE_LAST_FILE_KEY, last);
+    }
+}
+
 /// One entry in the left-hand navigation: a tab with a title and a short description.
 fn nav_tab(ui: &mut egui::Ui, selected: bool, title: &str, subtitle: &str) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), egui::Sense::click());
+    // Lay the text out first, wrapped to the box width, so the box grows to fit it.
+    const PAD_X: f32 = 14.0;
+    const PAD_Y: f32 = 9.0;
+    const GAP: f32 = 4.0;
+    let width = ui.available_width();
+    let wrap = (width - PAD_X - 10.0).max(40.0);
+    let (title_galley, subtitle_galley) = ui.fonts_mut(|f| {
+        (
+            f.layout(title.to_string(), egui::FontId::proportional(15.0), egui::Color32::PLACEHOLDER, wrap),
+            f.layout(subtitle.to_string(), egui::FontId::proportional(12.0), egui::Color32::PLACEHOLDER, wrap),
+        )
+    });
+    let height = (PAD_Y + title_galley.size().y + GAP + subtitle_galley.size().y + PAD_Y).max(52.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
     let visuals = ui.style().interact_selectable(&resp, selected);
     let painter = ui.painter();
     painter.rect(rect, 6.0, visuals.weak_bg_fill, visuals.bg_stroke, egui::StrokeKind::Inside);
@@ -931,8 +1056,10 @@ fn nav_tab(ui: &mut egui::Ui, selected: bool, title: &str, subtitle: &str) -> eg
         painter.rect_filled(bar, 2.0, ui.visuals().selection.stroke.color);
     }
     let text = visuals.text_color();
-    painter.text(rect.left_top() + egui::vec2(14.0, 9.0), egui::Align2::LEFT_TOP, title, egui::FontId::proportional(15.0), text);
-    painter.text(rect.left_top() + egui::vec2(14.0, 30.0), egui::Align2::LEFT_TOP, subtitle, egui::FontId::proportional(12.0), text);
+    let title_pos = rect.left_top() + egui::vec2(PAD_X, PAD_Y);
+    let subtitle_pos = title_pos + egui::vec2(0.0, title_galley.size().y + GAP);
+    painter.galley(title_pos, title_galley, text);
+    painter.galley(subtitle_pos, subtitle_galley, text);
     if resp.has_focus() {
         painter.rect_stroke(rect.expand(1.0), 6.0, ui.visuals().selection.stroke, egui::StrokeKind::Outside);
     }
@@ -950,9 +1077,9 @@ impl App {
         ui.separator();
         ui.add_space(6.0);
         for (tool, title, subtitle) in [
-            (Tool::Accessibility, "Accessibility Checker", "Scan a page for WCAG issues"),
-            (Tool::Links, "Link Checker", "Find broken links in a list"),
             (Tool::Sortsite, "Sortsite Eval", "Review a SortSite Excel report"),
+            (Tool::Accessibility, "WCAG Scanner", "Scan a page for WCAG issues"),
+            (Tool::Links, "Link Checker", "Find broken links in a list"),
         ] {
             if nav_tab(ui, self.tool == tool, title, subtitle).clicked() {
                 self.tool = tool;
@@ -965,7 +1092,7 @@ impl App {
         });
     }
 
-    /// The Accessibility Checker tool (URL scanner, results, preview and source).
+    /// The WCAG Scanner tool (URL scanner, results, preview and source).
     fn accessibility_ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         egui::Panel::top("controls").show(ui, |ui| {
             self.controls(ui);
@@ -985,14 +1112,36 @@ impl App {
 
         let (clicked, link_clicked) = egui::CentralPanel::default()
             .show(ui, |ui| {
-                let link = self.links_section(ui);
-                (self.results(ui), link)
+                let ScanState::Done(report) = &self.state else { return (self.results(ui), None) };
+                let link_count = report.links.len();
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(self.results_tab == ResultsTab::Wcag, RichText::new("WCAG results").strong()).clicked() {
+                        self.results_tab = ResultsTab::Wcag;
+                    }
+                    if ui
+                        .selectable_label(self.results_tab == ResultsTab::Links, RichText::new(format!("Links ({link_count})")).strong())
+                        .on_hover_text("Every link on the page — click one to see where it is")
+                        .clicked()
+                    {
+                        self.results_tab = ResultsTab::Links;
+                    }
+                });
+                ui.separator();
+                match self.results_tab {
+                    ResultsTab::Wcag => {
+                        if (self.check_links || self.link_check_started()) && self.links_summary(ui) {
+                            self.results_tab = ResultsTab::Links;
+                        }
+                        (self.results(ui), None)
+                    }
+                    ResultsTab::Links => (None, self.links_tab(ui)),
+                }
             })
             .inner;
         if let Some(i) = link_clicked {
             self.select_link(i);
         }
-        if self.debug_select_link.is_some() && self.link_check_started() && self.link_run.is_none() && !self.preview.is_loading() {
+        if self.debug_select_link.is_some() && matches!(self.state, ScanState::Done(_)) && self.link_run.is_none() && !self.preview.is_loading() {
             let i = self.debug_select_link.take().expect("checked");
             self.select_link(i);
         }
@@ -1038,6 +1187,7 @@ impl App {
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string(DETAILS_SIDE_KEY, self.sortsite.details_side().as_str().to_string());
+        self.save_sortsite_settings(storage);
         // "Check links" is saved only when the user changes it (see `ui`), so a debug-build
         // override (ADA_CHECK_LINKS) never ends up in the user's settings.
     }
@@ -1050,7 +1200,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         // Keep polling the scan so it completes even while another tool is shown.
         self.poll(ui.ctx());
-        // "ADA Check" in Sortsite Eval: scan that page and show the Accessibility Checker.
+        // "ADA Check" in Sortsite Eval: scan that page and show the WCAG Scanner.
         if let Some(url) = self.sortsite.take_ada_check_request() {
             self.url = url;
             self.tool = Tool::Accessibility;
@@ -1086,6 +1236,12 @@ impl eframe::App for App {
         if std::mem::take(&mut self.check_links_changed) {
             if let Some(storage) = frame.storage_mut() {
                 storage.set_string(CHECK_LINKS_KEY, self.check_links.to_string());
+                storage.flush();
+            }
+        }
+        if self.sortsite.take_settings_changed() {
+            if let Some(storage) = frame.storage_mut() {
+                self.save_sortsite_settings(storage);
                 storage.flush();
             }
         }

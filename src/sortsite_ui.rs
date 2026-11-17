@@ -109,7 +109,7 @@ pub struct SortsiteEval {
     debug_accept_save: bool,
     debug_check_link: bool,
     debug_ada_check: bool,
-    /// A page URL the user asked to run through the Accessibility Checker ("ADA Check");
+    /// A page URL the user asked to run through the WCAG Scanner ("ADA Check");
     /// taken by the app, which switches to that tool and scans it.
     ada_check_request: Option<String>,
     /// Notes per worksheet and Excel row (written to the file's Notes column).
@@ -122,6 +122,19 @@ pub struct SortsiteEval {
     note_focus_lost: bool,
     /// Debug builds only: a note to set on the preselected row after loading.
     debug_note: Option<String>,
+    /// Reopen the last spreadsheet when the app starts (saved setting).
+    reopen_last: bool,
+    /// The spreadsheet to reopen: the last one opened, or its "-fixed" copy once saved.
+    last_file: Option<PathBuf>,
+    /// The toggle or last file changed; the app saves its settings.
+    settings_changed: bool,
+    /// Why the last spreadsheet couldn't be reopened at startup.
+    reopen_note: Option<String>,
+    /// Whether the file being opened / currently open should be remembered as the last one
+    /// (not for files opened by debug hooks).
+    pending_remember: bool,
+    loading_remember: bool,
+    remember_current: bool,
     /// "Check Link" results per (worksheet, Excel row).
     link_checks: HashMap<(String, u32), LinkCheck>,
 }
@@ -442,7 +455,8 @@ fn is_url(s: &str) -> bool {
 
 /// "1 row · 9 columns".
 fn size_text(rows: usize, cols: usize) -> String {
-    let plural = |n: usize, word: &str| if n == 1 { format!("1 {word}") } else { format!("{n} {word}s") };
+    // Non-breaking spaces keep each number with its word when the text wraps.
+    let plural = |n: usize, word: &str| if n == 1 { format!("1\u{a0}{word}") } else { format!("{n}\u{a0}{word}s") };
     format!("{} · {}", plural(rows, "row"), plural(cols, "column"))
 }
 
@@ -455,6 +469,45 @@ impl SortsiteEval {
     /// Opens `path` on the next frame (used by debug builds to preload a file).
     pub fn request_open(&mut self, path: PathBuf) {
         self.pending_open = Some(path);
+        self.pending_remember = false;
+    }
+
+    /// Restores the saved "reopen last spreadsheet" settings and, if enabled, opens that
+    /// file. A file already requested (by a debug hook) takes priority.
+    pub fn restore_settings(&mut self, reopen_last: bool, last_file: Option<PathBuf>) {
+        self.reopen_last = reopen_last;
+        self.last_file = last_file;
+        if !reopen_last || self.pending_open.is_some() {
+            return;
+        }
+        if let Some(path) = &self.last_file {
+            if path.is_file() {
+                self.pending_open = Some(path.clone());
+                self.pending_remember = true;
+            } else {
+                self.reopen_note = Some(format!("Couldn't reopen the last spreadsheet: {} is no longer there.", path.display()));
+            }
+        }
+    }
+
+    pub fn reopen_last(&self) -> bool {
+        self.reopen_last
+    }
+
+    pub fn last_file(&self) -> Option<&std::path::Path> {
+        self.last_file.as_deref()
+    }
+
+    /// True once after the reopen toggle or the last file changed.
+    pub fn take_settings_changed(&mut self) -> bool {
+        std::mem::take(&mut self.settings_changed)
+    }
+
+    fn remember(&mut self, path: &std::path::Path) {
+        if self.last_file.as_deref() != Some(path) {
+            self.last_file = Some(path.to_path_buf());
+            self.settings_changed = true;
+        }
     }
 
     pub fn details_side(&self) -> DetailsSide {
@@ -492,7 +545,7 @@ impl SortsiteEval {
         self.debug_ada_check = true;
     }
 
-    /// The page URL to scan in the Accessibility Checker, if "ADA Check" was clicked.
+    /// The page URL to scan in the WCAG Scanner, if "ADA Check" was clicked.
     pub fn take_ada_check_request(&mut self) -> Option<String> {
         self.ada_check_request.take()
     }
@@ -640,7 +693,9 @@ impl SortsiteEval {
         self.preselect = Some((sheet, row));
     }
 
-    fn open_path(&mut self, path: PathBuf, ctx: &egui::Context) {
+    fn open_path(&mut self, path: PathBuf, ctx: &egui::Context, remember: bool) {
+        self.loading_remember = remember;
+        self.reopen_note = None;
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         let p = path.clone();
@@ -662,7 +717,7 @@ impl SortsiteEval {
             dialog = dialog.set_directory(dir);
         }
         if let Some(path) = dialog.pick_file() {
-            self.open_path(path, ctx);
+            self.open_path(path, ctx, true);
         }
     }
 
@@ -725,13 +780,19 @@ impl SortsiteEval {
     /// Per-frame work independent of which tool is shown: finishes loading a workbook.
     pub fn frame(&mut self, ctx: &egui::Context) {
         if let Some(path) = self.pending_open.take() {
-            self.open_path(path, ctx);
+            let remember = std::mem::take(&mut self.pending_remember);
+            self.open_path(path, ctx, remember);
         }
         if let Some((_, rx)) = &self.loading {
             if let Ok(result) = rx.try_recv() {
                 self.loading = None;
                 match result {
                     Ok(wb) => {
+                        self.remember_current = self.loading_remember;
+                        if self.remember_current {
+                            let path = wb.path.clone();
+                            self.remember(&path);
+                        }
                         // A new workbook starts with the statuses saved in it. A file that is
                         // already a "-fixed" copy saves automatically; any other asks first.
                         self.statuses = wb.saved_statuses.clone();
@@ -828,6 +889,11 @@ impl SortsiteEval {
                 self.saving = None;
                 if result.is_err() {
                     self.unsaved = true;
+                }
+                // Once saved, the "-fixed" copy (with the user's changes) is what to reopen.
+                if let (Ok(path), true) = (&result, self.remember_current) {
+                    let path = path.clone();
+                    self.remember(&path);
                 }
                 self.last_save = Some(result);
                 if std::mem::take(&mut self.save_again) {
@@ -952,6 +1018,22 @@ impl SortsiteEval {
                 ui.label(format!("Opening {}…", path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()));
             }
         });
+        ui.add_space(6.0);
+        if ui
+            .checkbox(&mut self.reopen_last, "Reopen the last spreadsheet when the app starts")
+            .on_hover_text("Opens the spreadsheet you last worked on (its -fixed copy once your changes have been saved) each time ADA Checker starts")
+            .changed()
+        {
+            self.settings_changed = true;
+        }
+        if let Some(path) = &self.last_file {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            ui.label(RichText::new(format!("Last spreadsheet: {name}")).small().color(muted)).on_hover_text(path.display().to_string());
+        }
+        if let Some(note) = &self.reopen_note {
+            let amber = if ui.visuals().dark_mode { Color32::from_rgb(255, 204, 102) } else { Color32::from_rgb(138, 76, 0) };
+            ui.label(RichText::new(note).color(amber));
+        }
         if let Some(e) = &self.error {
             ui.add_space(6.0);
             let red = if ui.visuals().dark_mode { Color32::from_rgb(255, 138, 128) } else { Color32::from_rgb(176, 0, 32) };
@@ -1015,11 +1097,11 @@ impl SortsiteEval {
                 let mut subtitle = match &sheet.error {
                     Some(_) => "Could not be read".to_string(),
                     None if sheet.rows.is_empty() => "Empty".to_string(),
-                    None if marked > 0 => format!("{} · {marked} marked", size_text(data_rows(sheet, header), sheet.width)),
+                    None if marked > 0 => format!("{} · {marked}\u{a0}marked", size_text(data_rows(sheet, header), sheet.width)),
                     None => size_text(data_rows(sheet, header), sheet.width),
                 };
                 if noted > 0 {
-                    subtitle.push_str(&format!(" · {noted} {}", if noted == 1 { "note" } else { "notes" }));
+                    subtitle.push_str(&format!(" · {noted}\u{a0}{}", if noted == 1 { "note" } else { "notes" }));
                 }
                 let resp = crate::nav_tab(ui, self.selected == i, &sheet.name, &subtitle);
                 if resp.clicked() {
@@ -1271,7 +1353,7 @@ impl SortsiteEval {
                         let url = page_url.as_ref().map(|(_, u)| u.as_str()).unwrap_or("");
                         ui.button(RichText::new("ADA Check").strong())
                             .on_hover_text(format!(
-                                "Scan {url} in the Accessibility Checker, using the WCAG version and level selected there, and show the results."
+                                "Scan {url} in the WCAG Scanner, using the WCAG version and level selected there, and show the results."
                             ))
                             .clicked()
                     };
@@ -1656,6 +1738,42 @@ mod tests {
     }
 
     #[test]
+    fn reopens_the_last_spreadsheet_only_when_enabled() {
+        let dir = std::env::temp_dir().join(format!("adachecker-reopen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("ada.xlsx");
+        std::fs::write(&file, b"x").unwrap();
+
+        let mut off = SortsiteEval::default();
+        off.restore_settings(false, Some(file.clone()));
+        assert!(off.pending_open.is_none(), "toggle off: nothing opened");
+        assert_eq!(off.last_file(), Some(file.as_path()), "but the last file is still shown");
+
+        let mut on = SortsiteEval::default();
+        on.restore_settings(true, Some(file.clone()));
+        assert_eq!(on.pending_open.as_deref(), Some(file.as_path()));
+        assert!(on.pending_remember);
+
+        let mut gone = SortsiteEval::default();
+        gone.restore_settings(true, Some(dir.join("deleted.xlsx")));
+        assert!(gone.pending_open.is_none());
+        assert!(gone.reopen_note.as_deref().unwrap().contains("no longer there"));
+
+        let mut debug = SortsiteEval::default();
+        debug.request_open(dir.join("scratch.xlsx"));
+        debug.restore_settings(true, Some(file.clone()));
+        assert_eq!(debug.pending_open, Some(dir.join("scratch.xlsx")), "a debug-requested file wins");
+        assert!(!debug.pending_remember, "and is never remembered");
+
+        let mut s = SortsiteEval::default();
+        s.remember(&file);
+        assert!(s.take_settings_changed());
+        s.remember(&file);
+        assert!(!s.take_settings_changed(), "same file again is not a change");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn notes_column_is_reused_or_added() {
         let with = sheet_of(&[&["Guidelines", "Notes", "URL"], &["Broken Link", " checked ", "u"], &["x", "", "v"]]);
         assert_eq!(notes_column(&with), (1, true));
@@ -1733,9 +1851,9 @@ mod tests {
 
     #[test]
     fn size_text_pluralizes() {
-        assert_eq!(size_text(1, 9), "1 row · 9 columns");
-        assert_eq!(size_text(28, 1), "28 rows · 1 column");
-        assert_eq!(size_text(0, 0), "0 rows · 0 columns");
+        assert_eq!(size_text(1, 9), "1\u{a0}row · 9\u{a0}columns");
+        assert_eq!(size_text(28, 1), "28\u{a0}rows · 1\u{a0}column");
+        assert_eq!(size_text(0, 0), "0\u{a0}rows · 0\u{a0}columns");
     }
 
     #[test]
