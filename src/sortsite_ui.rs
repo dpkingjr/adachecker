@@ -4,7 +4,7 @@
 
 use crate::spreadsheet::{self, Sheet, Workbook};
 use crate::links::{self, Kind, LinkResult};
-use crate::xlsx_edit::{self, Status, Statuses};
+use crate::xlsx_edit::{self, Notes, Status, Statuses};
 use std::collections::HashMap;
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
@@ -80,6 +80,12 @@ pub struct SortsiteEval {
     selected_row: Option<usize>,
     /// Debug builds only: worksheet/row to select once the pending file has loaded.
     preselect: Option<(usize, Option<usize>)>,
+    /// Debug builds only: a sort to apply once the pending file has loaded.
+    debug_sort: Option<(usize, bool)>,
+    /// Column sort for the grid: (what, ascending). `None` is the sheet's own order.
+    sort: Option<(SortBy, bool)>,
+    /// The visible rows (filtered and sorted) for the last `ViewKey`.
+    view_cache: Option<(ViewKey, Vec<usize>)>,
     /// Where the row-details pane is docked (saved between runs by the app).
     details_side: DetailsSide,
     /// Set when the user picks a new side, so the app can save it right away.
@@ -102,6 +108,20 @@ pub struct SortsiteEval {
     debug_status: Option<Status>,
     debug_accept_save: bool,
     debug_check_link: bool,
+    debug_ada_check: bool,
+    /// A page URL the user asked to run through the Accessibility Checker ("ADA Check");
+    /// taken by the app, which switches to that tool and scans it.
+    ada_check_request: Option<String>,
+    /// Notes per worksheet and Excel row (written to the file's Notes column).
+    notes: Notes,
+    /// Bumped on every note edit (invalidates the cached, filtered view).
+    notes_rev: u64,
+    /// A note changed and hasn't been registered as a change to save yet.
+    note_pending: Option<std::time::Instant>,
+    /// The Notes box lost keyboard focus this frame.
+    note_focus_lost: bool,
+    /// Debug builds only: a note to set on the preselected row after loading.
+    debug_note: Option<String>,
     /// "Check Link" results per (worksheet, Excel row).
     link_checks: HashMap<(String, u32), LinkCheck>,
 }
@@ -155,6 +175,13 @@ fn link_column(header: &[String], row: &[String]) -> Option<usize> {
         .or_else(|| col("Detail").filter(|&c| cell(c).contains("http://") || cell(c).contains("https://")))
 }
 
+/// The row's page URL (SortSite's "URL" column), if it holds one: what "ADA Check" scans.
+fn page_url_column(header: &[String], row: &[String]) -> Option<(usize, String)> {
+    let c = header.iter().position(|h| h.trim().eq_ignore_ascii_case("URL"))?;
+    let value = row.get(c).map(|v| v.trim()).filter(|v| is_url(v))?;
+    Some((c, value.to_string()))
+}
+
 /// Result of re-checking a broken link.
 #[derive(Clone)]
 struct LinkCheckOutcome {
@@ -177,6 +204,25 @@ impl LinkCheckOutcome {
         matches!(self.result.kind, Kind::Ok | Kind::Redirected) && matches!(self.anchor, None | Some(Ok(true)))
     }
 
+    /// The link is still broken: an error response, no connection, or a missing anchor.
+    /// (A refused check — 401/403/429 — or an anchor that couldn't be checked proves
+    /// nothing either way.)
+    fn broken(&self) -> bool {
+        (matches!(self.result.kind, Kind::Broken | Kind::Error) && !self.result.timed_out())
+            || (matches!(self.result.kind, Kind::Ok | Kind::Redirected) && matches!(self.anchor, Some(Ok(false))))
+    }
+
+    /// The status a check sets on its row, as if the user had pressed that button.
+    fn verdict(&self) -> Option<Status> {
+        if self.works() {
+            Some(Status::Fixed)
+        } else if self.broken() {
+            Some(Status::Broken)
+        } else {
+            None
+        }
+    }
+
     fn fragment(&self) -> String {
         self.url.split_once('#').map(|(_, f)| f.to_string()).unwrap_or_default()
     }
@@ -197,15 +243,20 @@ impl LinkCheckOutcome {
             return (msg, Tone::Good);
         }
         match (&r.kind, &self.anchor) {
-            (Kind::Ok | Kind::Redirected, Some(Ok(false))) => {
-                (format!("✖ The page loads ({status}) but the #{} anchor is still missing.", self.fragment()), Tone::Bad)
-            }
+            (Kind::Ok | Kind::Redirected, Some(Ok(false))) => (
+                format!("✖ The page loads ({status}) but the #{} anchor is still missing — marked Broken.", self.fragment()),
+                Tone::Bad,
+            ),
             (Kind::Ok | Kind::Redirected, Some(Err(e))) => (format!("⚠ The page loads ({status}) but its anchor couldn't be checked: {e}"), Tone::Warn),
             (Kind::Restricted, _) => {
                 (format!("⚠ The server refused the check ({status}). The link may work in a browser — not marked."), Tone::Warn)
             }
-            (Kind::Error, _) => (format!("✖ Still broken: {}", r.reason), Tone::Bad),
-            _ => (format!("✖ Still broken: {status}"), Tone::Bad),
+            (Kind::Error, _) if r.timed_out() => (
+                "⚠ Timed out — the site may be slow or only reachable on another network. Not marked.".to_string(),
+                Tone::Warn,
+            ),
+            (Kind::Error, _) => (format!("✖ Still broken: {} — marked Broken.", r.reason), Tone::Bad),
+            _ => (format!("✖ Still broken: {status} — marked Broken."), Tone::Bad),
         }
     }
 }
@@ -215,15 +266,147 @@ enum LinkCheck {
     Done(LinkCheckOutcome),
 }
 
+/// What the grid is sorted by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SortBy {
+    /// The Excel row number (the original order).
+    Row,
+    /// A data column, by index.
+    Column(usize),
+}
+
+/// Compares two cell texts the way people expect: numbers numerically, text without regard
+/// to case, and digit runs inside text by value ("Line 9" before "Line 10", "933 1018"
+/// before "1173 1308").
+fn compare_cells(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (a, b) = (a.trim(), b.trim());
+    if let (Ok(x), Ok(y)) = (a.parse::<f64>(), b.parse::<f64>()) {
+        return x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+    }
+    let (mut ia, mut ib) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (ia.peek().copied(), ib.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(ca), Some(cb)) if ca.is_ascii_digit() && cb.is_ascii_digit() => {
+                // Compare whole digit runs by value: strip leading zeros, then length, then digits.
+                let take = |it: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut run = String::new();
+                    while let Some(c) = it.peek().copied().filter(char::is_ascii_digit) {
+                        run.push(c);
+                        it.next();
+                    }
+                    run
+                };
+                let (ra, rb) = (take(&mut ia), take(&mut ib));
+                let (ta, tb) = (ra.trim_start_matches('0'), rb.trim_start_matches('0'));
+                let ord = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            (Some(ca), Some(cb)) => {
+                let ord = ca.to_lowercase().cmp(cb.to_lowercase());
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+                ia.next();
+                ib.next();
+            }
+        }
+    }
+}
+
+/// Sorts row indices by `by`. Empty cells go last in both directions, and ties keep their
+/// original order (the sort is stable).
+fn sort_rows(rows: &mut [usize], by: SortBy, ascending: bool, text: impl Fn(usize, usize) -> String) {
+    match by {
+        SortBy::Row => {
+            if !ascending {
+                rows.reverse();
+            }
+        }
+        SortBy::Column(c) => {
+            let mut keyed: Vec<(usize, String)> = rows.iter().map(|&r| (r, text(r, c).trim().to_string())).collect();
+            keyed.sort_by(|(_, a), (_, b)| match (a.is_empty(), b.is_empty()) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                _ if ascending => compare_cells(a, b),
+                _ => compare_cells(b, a),
+            });
+            for (slot, (r, _)) in rows.iter_mut().zip(keyed) {
+                *slot = r;
+            }
+        }
+    }
+}
+
+/// The grid column that holds notes: the sheet's own "Notes" column if it has one
+/// (`true`), otherwise a new column after the last one (`false`).
+fn notes_column(sheet: &Sheet) -> (usize, bool) {
+    match sheet.rows.first().and_then(|h| h.iter().position(|v| v.trim().eq_ignore_ascii_case(xlsx_edit::NOTES_HEADER))) {
+        Some(c) => (c, true),
+        None => (sheet.width, false),
+    }
+}
+
+/// Number of columns the grid shows (the sheet's, plus a new Notes column if needed).
+fn grid_width(sheet: &Sheet) -> usize {
+    if notes_column(sheet).1 { sheet.width } else { sheet.width + 1 }
+}
+
+fn excel_row(sheet: &Sheet, r: usize) -> u32 {
+    (sheet.first_row + r + 1) as u32
+}
+
+/// Notes already in the workbook's Notes columns (e.g. when reopening a `-fixed` file).
+fn initial_notes(wb: &Workbook) -> Notes {
+    let mut notes = Notes::new();
+    for sheet in &wb.sheets {
+        let (c, existing) = notes_column(sheet);
+        if !existing {
+            continue;
+        }
+        let rows: std::collections::BTreeMap<u32, String> = (1..sheet.rows.len())
+            .filter_map(|r| sheet.rows[r].get(c).map(|v| v.trim()).filter(|v| !v.is_empty()).map(|v| (excel_row(sheet, r), v.to_string())))
+            .collect();
+        if !rows.is_empty() {
+            notes.insert(sheet.name.clone(), rows);
+        }
+    }
+    notes
+}
+
+/// Inputs that determine the grid's visible, sorted rows (for caching).
+#[derive(Clone, PartialEq)]
+struct ViewKey {
+    workbook: usize,
+    sheet: usize,
+    header: bool,
+    filter: String,
+    sort: Option<(SortBy, bool)>,
+    notes_rev: u64,
+}
+
+/// A `-fixed` copy (that can be saved) is saved into itself automatically, without asking.
+fn saves_in_place(path: &std::path::Path) -> bool {
+    xlsx_edit::is_editable(path) && xlsx_edit::fixed_path(path) == path
+}
+
 /// Row fill shown in the app: dark shades in dark mode so text stays readable.
 fn status_fill(status: Status, dark: bool) -> Color32 {
     match (status, dark) {
         (Status::Fixed, true) => Color32::from_rgb(34, 85, 45),
         (Status::OnHold, true) => Color32::from_rgb(95, 80, 15),
         (Status::NotApplicable, true) => Color32::from_rgb(72, 72, 72),
+        (Status::Broken, true) => Color32::from_rgb(110, 32, 38),
         (Status::Fixed, false) => Color32::from_rgb(198, 239, 206),
         (Status::OnHold, false) => Color32::from_rgb(255, 235, 156),
         (Status::NotApplicable, false) => Color32::from_rgb(217, 217, 217),
+        (Status::Broken, false) => Color32::from_rgb(255, 199, 206),
     }
 }
 
@@ -304,6 +487,16 @@ impl SortsiteEval {
         self.debug_check_link = check_link;
     }
 
+    /// Debug builds only: press "ADA Check" on the preselected row after loading.
+    pub fn debug_ada_check(&mut self) {
+        self.debug_ada_check = true;
+    }
+
+    /// The page URL to scan in the Accessibility Checker, if "ADA Check" was clicked.
+    pub fn take_ada_check_request(&mut self) -> Option<String> {
+        self.ada_check_request.take()
+    }
+
     /// Re-checks a broken link in the background; `frame` marks the row Fixed if it works.
     fn start_link_check(&mut self, sheet: &str, excel_row: u32, url: String, ctx: &egui::Context) {
         let key = (sheet.to_string(), excel_row);
@@ -361,14 +554,48 @@ impl SortsiteEval {
         if rows.is_empty() {
             self.statuses.remove(sheet);
         }
+        self.register_change(ctx);
+    }
+
+    /// A status or note changed: ask before the first save of an original file, otherwise
+    /// save automatically (when enabled).
+    fn register_change(&mut self, ctx: &egui::Context) {
         self.unsaved = true;
         if !self.asked_to_save {
-            // First status change for this workbook: ask before writing any file.
             self.asked_to_save = true;
             self.show_save_prompt = true;
         } else if self.autosave {
             self.start_save(ctx);
         }
+    }
+
+    fn note_of(&self, sheet: &str, excel_row: u32) -> &str {
+        self.notes.get(sheet).and_then(|rows| rows.get(&excel_row)).map(String::as_str).unwrap_or("")
+    }
+
+    /// Updates a note. It is registered for saving once the user leaves the Notes box (or,
+    /// with automatic saving on, after a short pause in typing) — see `frame`.
+    fn set_note(&mut self, sheet: &str, excel_row: u32, text: String) {
+        if self.note_of(sheet, excel_row) == text {
+            return;
+        }
+        let rows = self.notes.entry(sheet.to_string()).or_default();
+        if text.trim().is_empty() {
+            rows.remove(&excel_row);
+        } else {
+            rows.insert(excel_row, text);
+        }
+        if rows.is_empty() {
+            self.notes.remove(sheet);
+        }
+        self.notes_rev += 1;
+        self.unsaved = true;
+        self.note_pending = Some(std::time::Instant::now());
+    }
+
+    /// Debug builds only: set `text` as the note of the preselected row after loading.
+    pub fn debug_note(&mut self, text: String) {
+        self.debug_note = Some(text);
     }
 
     fn save_target(&self) -> Option<PathBuf> {
@@ -390,15 +617,22 @@ impl SortsiteEval {
             return;
         }
         let statuses = self.statuses.clone();
+        let notes = self.notes.clone();
+        self.note_pending = None;
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = xlsx_edit::save_with_statuses(&original, &statuses, &target).map(|()| target);
+            let result = xlsx_edit::save_changes(&original, &statuses, &notes, &target).map(|()| target);
             let _ = tx.send(result);
             ctx.request_repaint();
         });
         self.saving = Some(rx);
         self.unsaved = false;
+    }
+
+    /// Debug builds only: sort by data column `col` after loading.
+    pub fn debug_sort(&mut self, col: usize, ascending: bool) {
+        self.debug_sort = Some((col, ascending));
     }
 
     /// Debug builds only: selects worksheet `sheet` (and optionally a row) after loading.
@@ -437,7 +671,55 @@ impl SortsiteEval {
             self.selected = i;
             self.filter.clear();
             self.selected_row = None;
+            self.sort = None;
         }
+    }
+
+    /// Header click: ascending → descending → original order.
+    fn cycle_sort(&mut self, by: SortBy) {
+        self.sort = match self.sort {
+            Some((current, true)) if current == by => Some((by, false)),
+            Some((current, false)) if current == by => None,
+            _ => Some((by, true)),
+        };
+    }
+
+    /// Rows to show: filtered by the filter text, then sorted. Cached until something
+    /// that affects it changes.
+    fn visible_rows(&mut self, wb: &Workbook, sheet: &Sheet) -> Vec<usize> {
+        let header = !self.no_header_row;
+        let key = ViewKey {
+            workbook: wb as *const Workbook as usize,
+            sheet: self.selected,
+            header,
+            filter: self.filter.trim().to_lowercase(),
+            sort: self.sort,
+            notes_rev: self.notes_rev,
+        };
+        if let Some((k, rows)) = &self.view_cache {
+            if *k == key {
+                return rows.clone();
+            }
+        }
+        let start = usize::from(header);
+        let (notes_col, _) = notes_column(sheet);
+        let sheet_notes = self.notes.get(&sheet.name);
+        let text = |r: usize, c: usize| -> String {
+            if c == notes_col {
+                sheet_notes.and_then(|m| m.get(&excel_row(sheet, r))).cloned().unwrap_or_default()
+            } else {
+                sheet.rows[r].get(c).cloned().unwrap_or_default()
+            }
+        };
+        let width = grid_width(sheet);
+        let mut rows: Vec<usize> = (start..sheet.rows.len())
+            .filter(|&r| key.filter.is_empty() || (0..width).any(|c| text(r, c).to_lowercase().contains(&key.filter)))
+            .collect();
+        if let Some((by, ascending)) = self.sort {
+            sort_rows(&mut rows, by, ascending, text);
+        }
+        self.view_cache = Some((key, rows.clone()));
+        rows
     }
 
     /// Per-frame work independent of which tool is shown: finishes loading a workbook.
@@ -450,12 +732,16 @@ impl SortsiteEval {
                 self.loading = None;
                 match result {
                     Ok(wb) => {
-                        // A new workbook starts with the statuses saved in it, and asks again
-                        // before saving.
+                        // A new workbook starts with the statuses saved in it. A file that is
+                        // already a "-fixed" copy saves automatically; any other asks first.
                         self.statuses = wb.saved_statuses.clone();
+                        self.notes = initial_notes(&wb);
+                        self.notes_rev += 1;
+                        self.note_pending = None;
                         self.link_checks.clear();
-                        self.asked_to_save = false;
-                        self.autosave = false;
+                        let already_fixed = saves_in_place(&wb.path);
+                        self.asked_to_save = already_fixed;
+                        self.autosave = already_fixed;
                         self.show_save_prompt = false;
                         self.unsaved = false;
                         self.last_save = None;
@@ -473,6 +759,21 @@ impl SortsiteEval {
                                     }
                                 }
                             }
+                            if let (Some(text), Some(r), Some(wb)) = (self.debug_note.take(), row, self.workbook.clone()) {
+                                if let Some(sh) = wb.sheets.get(sheet) {
+                                    self.set_note(&sh.name, excel_row(sh, r), text);
+                                    self.note_focus_lost = true;
+                                }
+                            }
+                            if std::mem::take(&mut self.debug_ada_check) {
+                                if let (Some(r), Some(wb)) = (row, self.workbook.clone()) {
+                                    if let Some(sh) = wb.sheets.get(sheet) {
+                                        if let (Some(header), Some(cells)) = (sh.rows.first(), sh.rows.get(r)) {
+                                            self.ada_check_request = page_url_column(header, cells).map(|(_, u)| u);
+                                        }
+                                    }
+                                }
+                            }
                             if std::mem::take(&mut self.debug_check_link) {
                                 if let (Some(r), Some(wb)) = (row, self.workbook.clone()) {
                                     if let Some(sh) = wb.sheets.get(sheet) {
@@ -485,6 +786,9 @@ impl SortsiteEval {
                                 }
                             }
                         }
+                        if let Some((col, ascending)) = self.debug_sort.take() {
+                            self.sort = Some((SortBy::Column(col), ascending));
+                        }
                         self.tab = Tab::Sheets;
                     }
                     Err(e) => self.error = Some(e),
@@ -492,19 +796,32 @@ impl SortsiteEval {
             }
         }
         // Finished link checks: a link that works now marks its row Fixed.
-        let mut now_working = Vec::new();
+        // A note edit counts as a change once the user leaves the box, or — with automatic
+        // saving on — after a short pause in typing (so the save prompt never interrupts).
+        if let Some(since) = self.note_pending {
+            let paused = since.elapsed() >= std::time::Duration::from_millis(1200);
+            if std::mem::take(&mut self.note_focus_lost) || (self.autosave && paused) {
+                self.note_pending = None;
+                self.register_change(ctx);
+            } else if self.autosave {
+                ctx.request_repaint_after(std::time::Duration::from_millis(1300));
+            }
+        }
+        self.note_focus_lost = false;
+        // Finished link checks mark their row Fixed or Broken, as if that button were pressed.
+        let mut verdicts = Vec::new();
         for (key, check) in self.link_checks.iter_mut() {
             if let LinkCheck::Running(rx) = check {
                 if let Ok(outcome) = rx.try_recv() {
-                    if outcome.works() {
-                        now_working.push(key.clone());
+                    if let Some(status) = outcome.verdict() {
+                        verdicts.push((key.clone(), status));
                     }
                     *check = LinkCheck::Done(outcome);
                 }
             }
         }
-        for (sheet, row) in now_working {
-            self.set_status(&sheet, row, Some(Status::Fixed), ctx);
+        for ((sheet, row), status) in verdicts {
+            self.set_status(&sheet, row, Some(status), ctx);
         }
         if let Some(rx) = &self.saving {
             if let Ok(result) = rx.try_recv() {
@@ -590,6 +907,9 @@ impl SortsiteEval {
                         .on_disabled_hover_text("Open a spreadsheet first")
                         .clicked()
                     {
+                        if let Some((col, ascending)) = self.debug_sort.take() {
+                            self.sort = Some((SortBy::Column(col), ascending));
+                        }
                         self.tab = Tab::Sheets;
                     }
                 });
@@ -691,12 +1011,16 @@ impl SortsiteEval {
         egui::ScrollArea::vertical().id_salt("sheet-list-scroll").auto_shrink([false, false]).show(ui, |ui| {
             for (i, sheet) in wb.sheets.iter().enumerate() {
                 let marked = self.statuses.get(&sheet.name).map_or(0, |m| m.len());
-                let subtitle = match &sheet.error {
+                let noted = self.notes.get(&sheet.name).map_or(0, |m| m.len());
+                let mut subtitle = match &sheet.error {
                     Some(_) => "Could not be read".to_string(),
                     None if sheet.rows.is_empty() => "Empty".to_string(),
                     None if marked > 0 => format!("{} · {marked} marked", size_text(data_rows(sheet, header), sheet.width)),
                     None => size_text(data_rows(sheet, header), sheet.width),
                 };
+                if noted > 0 {
+                    subtitle.push_str(&format!(" · {noted} {}", if noted == 1 { "note" } else { "notes" }));
+                }
                 let resp = crate::nav_tab(ui, self.selected == i, &sheet.name, &subtitle);
                 if resp.clicked() {
                     clicked = Some(i);
@@ -724,18 +1048,22 @@ impl SortsiteEval {
             return;
         }
         let muted = muted(ui);
-        let counts: Vec<String> = Status::ALL
+        let mut counts: Vec<String> = Status::ALL
             .iter()
             .filter_map(|s| {
                 let n = self.statuses.get(&sheet.name).map_or(0, |m| m.values().filter(|v| *v == s).count());
                 (n > 0).then(|| format!("{} {n}", s.label()))
             })
             .collect();
+        let noted = self.notes.get(&sheet.name).map_or(0, |m| m.len());
+        if noted > 0 {
+            counts.push(format!("Notes {noted}"));
+        }
         let mut save_now = false;
         let target_name = self.save_target().and_then(|t| t.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default();
         ui.horizontal(|ui| {
             if counts.is_empty() {
-                ui.label(RichText::new("Click a row, then set its status in the details pane.").color(muted));
+                ui.label(RichText::new("Click a row, then set its status or add a note in the details pane.").color(muted));
             } else {
                 ui.label(RichText::new(counts.join(" · ")).color(muted));
             }
@@ -789,11 +1117,7 @@ impl SortsiteEval {
         }
 
         let header = !self.no_header_row;
-        let start = usize::from(header);
-        let needle = self.filter.trim().to_lowercase();
-        let visible: Vec<usize> = (start..sheet.rows.len())
-            .filter(|&r| needle.is_empty() || sheet.rows[r].iter().any(|c| c.to_lowercase().contains(&needle)))
-            .collect();
+        let visible = self.visible_rows(wb, sheet);
 
         ui.horizontal(|ui| {
             let mut header_on = header;
@@ -813,10 +1137,24 @@ impl SortsiteEval {
         self.status_bar(ui, wb, sheet);
         ui.add_space(4.0);
 
+        let (notes_col, notes_existing) = notes_column(sheet);
         let column_title = |c: usize| -> String {
+            if c == notes_col && !notes_existing {
+                return xlsx_edit::NOTES_HEADER.to_string();
+            }
             let name = if header { sheet.rows[0].get(c).map(|s| s.trim()).unwrap_or("") } else { "" };
             if name.is_empty() { sheet.column_letter(c) } else { name.to_string() }
         };
+        let sheet_notes = self.notes.get(&sheet.name).cloned().unwrap_or_default();
+        // A grid cell's text: the note for the Notes column, the sheet's value otherwise.
+        let cell_text = |r: usize, c: usize| -> String {
+            if c == notes_col {
+                sheet_notes.get(&excel_row(sheet, r)).cloned().unwrap_or_default()
+            } else {
+                sheet.rows[r].get(c).cloned().unwrap_or_default()
+            }
+        };
+        let gw = grid_width(sheet);
 
         // Details of the selected row, every column in full (selectable for copying), docked
         // below, right or left of the grid like a browser's developer tools.
@@ -832,11 +1170,18 @@ impl SortsiteEval {
             let broken_link = if header { sheet.rows.first().and_then(|h| broken_link_target(h, &sheet.rows[r])) } else { None };
             // The field the button sits beside: the column the link was taken from.
             let link_col = if matches!(broken_link, Some(Some(_))) { sheet.rows.first().and_then(|h| link_column(h, &sheet.rows[r])) } else { None };
+            // "ADA Check" sits beside the row's page URL.
+            let page_url = if header { sheet.rows.first().and_then(|h| page_url_column(h, &sheet.rows[r])) } else { None };
+            let mut ada_click = false;
             let check_view: Option<Option<(String, Tone)>> = self.link_checks.get(&(sheet.name.clone(), excel_row)).map(|c| match c {
                 LinkCheck::Running(_) => None,
                 LinkCheck::Done(o) => Some(o.message()),
             });
             let mut start_check = false;
+            // The Notes box edits a copy; changes are stored after the pane is drawn.
+            let mut note_text = self.note_of(&sheet.name, excel_row).to_string();
+            let original_note = note_text.clone();
+            let mut note_lost_focus = false;
             let content = |ui: &mut egui::Ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -860,34 +1205,48 @@ impl SortsiteEval {
                     });
                 });
                 ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    let label = ui.label("Status:");
+                // One toggle button per status; clicking the active one clears it.
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Status:");
                     ui.add_enabled_ui(editable, |ui| {
-                        let text = current.map_or("Set status…", Status::label);
-                        egui::ComboBox::from_id_salt("row-status")
-                            .selected_text(text)
-                            .show_ui(ui, |ui| {
-                                for option in Status::ALL {
-                                    let mut job = egui::text::LayoutJob::default();
-                                    job.append("■ ", 0.0, egui::TextFormat::simple(egui::FontId::proportional(14.0), excel_color(option)));
-                                    job.append(option.label(), 0.0, egui::TextFormat::simple(egui::FontId::proportional(14.0), ui.visuals().text_color()));
-                                    if ui.selectable_label(current == Some(option), job).clicked() {
-                                        status_choice = Some(Some(option));
-                                    }
-                                }
-                                if current.is_some() {
-                                    ui.separator();
-                                    if ui.selectable_label(false, "Clear status").clicked() {
-                                        status_choice = Some(None);
-                                    }
-                                }
-                            })
-                            .response
-                            .labelled_by(label.id)
-                            .on_hover_text("Mark this row Fixed, On-Hold or N/A")
-                            .on_disabled_hover_text("Statuses can be saved for .xlsx and .xlsm files only");
+                        for option in Status::ALL {
+                            let active = current == Some(option);
+                            let mut job = egui::text::LayoutJob::default();
+                            job.append("■ ", 0.0, egui::TextFormat::simple(egui::FontId::proportional(14.0), excel_color(option)));
+                            // The active button uses the selection text colour so its label stays readable.
+                            let text_color = if active { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() };
+                            job.append(option.label(), 0.0, egui::TextFormat::simple(egui::FontId::proportional(14.0), text_color));
+                            let hover = if active {
+                                format!("This row is marked {}. Click again to clear it.", option.label())
+                            } else {
+                                format!("Mark this row {}", option.label())
+                            };
+                            if ui
+                                .add(egui::Button::new(job).selected(active).frame(true).frame_when_inactive(true))
+                                .on_hover_text(hover)
+                                .on_disabled_hover_text("Statuses can be saved for .xlsx and .xlsm files only")
+                                .clicked()
+                            {
+                                status_choice = Some(if active { None } else { Some(option) });
+                            }
+                        }
                     });
                 });
+                // Notes: a comment about the issue, saved to the spreadsheet's Notes column.
+                ui.add_space(4.0);
+                let notes_label = ui.label("Notes:");
+                let edit = ui
+                    .add_enabled(
+                        editable,
+                        egui::TextEdit::multiline(&mut note_text)
+                            .id_salt(("row-note", sheet.name.as_str(), excel_row))
+                            .hint_text("Add a comment about this issue…")
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .labelled_by(notes_label.id)
+                    .on_disabled_hover_text("Notes can be saved for .xlsx and .xlsm files only");
+                note_lost_focus = edit.lost_focus();
                 if matches!(broken_link, Some(None)) {
                     ui.label(RichText::new("Broken link, but no URL was found in Target URL or Detail to check.").small().color(muted));
                 }
@@ -907,6 +1266,15 @@ impl SortsiteEval {
                     // side layouts, where a long URL can't share its line.
                     let link_url = broken_link.clone().flatten();
                     let is_link_field = |c: usize| link_url.is_some() && link_col == Some(c);
+                    let is_page_field = |c: usize| page_url.as_ref().is_some_and(|(col, _)| *col == c);
+                    let ada_button = |ui: &mut egui::Ui| -> bool {
+                        let url = page_url.as_ref().map(|(_, u)| u.as_str()).unwrap_or("");
+                        ui.button(RichText::new("ADA Check").strong())
+                            .on_hover_text(format!(
+                                "Scan {url} in the Accessibility Checker, using the WCAG version and level selected there, and show the results."
+                            ))
+                            .clicked()
+                    };
                     let check_button = |ui: &mut egui::Ui| -> bool {
                         let running = matches!(check_view, Some(None));
                         ui.add_enabled(!running, egui::Button::new(RichText::new("Check Link").strong()))
@@ -941,7 +1309,7 @@ impl SortsiteEval {
                     if side == DetailsSide::Bottom {
                         // Wide pane: names and values side by side.
                         egui::Grid::new("row-details-grid").num_columns(2).spacing([16.0, 6.0]).striped(true).show(ui, |ui| {
-                            for c in 0..sheet.width {
+                            for c in (0..sheet.width).filter(|&c| !(notes_existing && c == notes_col)) {
                                 let value = sheet.rows[r].get(c).map(String::as_str).unwrap_or("");
                                 ui.label(RichText::new(column_title(c)).strong());
                                 if is_link_field(c) {
@@ -954,6 +1322,13 @@ impl SortsiteEval {
                                         });
                                         check_result(ui);
                                     });
+                                } else if is_page_field(c) {
+                                    ui.horizontal(|ui| {
+                                        if ada_button(ui) {
+                                            ada_click = true;
+                                        }
+                                        value_widget(ui, value);
+                                    });
                                 } else {
                                     value_widget(ui, value);
                                 }
@@ -962,7 +1337,7 @@ impl SortsiteEval {
                         });
                     } else {
                         // Narrow side pane: each name above its value.
-                        for c in 0..sheet.width {
+                        for c in (0..sheet.width).filter(|&c| !(notes_existing && c == notes_col)) {
                             let value = sheet.rows[r].get(c).map(String::as_str).unwrap_or("");
                             if is_link_field(c) {
                                 ui.horizontal(|ui| {
@@ -973,6 +1348,14 @@ impl SortsiteEval {
                                 });
                                 value_widget(ui, value);
                                 check_result(ui);
+                            } else if is_page_field(c) {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(column_title(c)).strong());
+                                    if ada_button(ui) {
+                                        ada_click = true;
+                                    }
+                                });
+                                value_widget(ui, value);
                             } else {
                                 ui.label(RichText::new(column_title(c)).strong());
                                 value_widget(ui, value);
@@ -1007,6 +1390,15 @@ impl SortsiteEval {
                     self.start_link_check(&sheet.name, excel_row, url, &ui.ctx().clone());
                 }
             }
+            if ada_click {
+                self.ada_check_request = page_url.map(|(_, u)| u);
+            }
+            if note_text != original_note {
+                self.set_note(&sheet.name, excel_row, note_text);
+            }
+            if note_lost_focus {
+                self.note_focus_lost = true;
+            }
         }
 
         if visible.is_empty() {
@@ -1016,10 +1408,10 @@ impl SortsiteEval {
 
         // Size columns to their content (header + a sample of rows), within limits.
         let char_w = 7.2;
-        let widths: Vec<f32> = (0..sheet.width)
+        let widths: Vec<f32> = (0..gw)
             .map(|c| {
-                let longest = std::iter::once(column_title(c).chars().count())
-                    .chain(visible.iter().take(200).map(|&r| sheet.rows[r].get(c).map(|s| s.chars().count()).unwrap_or(0)))
+                let longest = std::iter::once(column_title(c).chars().count().max(if c == notes_col { 24 } else { 0 }))
+                    .chain(visible.iter().take(200).map(|&r| cell_text(r, c).chars().count()))
                     .max()
                     .unwrap_or(4);
                 (longest as f32 * char_w + 18.0).clamp(64.0, 380.0)
@@ -1028,6 +1420,8 @@ impl SortsiteEval {
 
         let row_h = ui.text_style_height(&egui::TextStyle::Body) + 8.0;
         let mut clicked_row = None;
+        let mut sort_click: Option<SortBy> = None;
+        let sort = self.sort;
         let sheet_statuses = self.statuses.get(&sheet.name).cloned().unwrap_or_default();
         egui::ScrollArea::horizontal().id_salt(("grid-hscroll", self.selected)).auto_shrink([false, false]).show(ui, |ui| {
             // No gaps between cells, so a row's status colour is continuous; cells pad themselves.
@@ -1045,16 +1439,36 @@ impl SortsiteEval {
             }
             table
                 .header(row_h + 2.0, |mut h| {
-                    h.col(|ui| {
-                        ui.add_space(6.0);
-                        ui.label(RichText::new("Row").strong().color(muted));
-                    });
-                    for c in 0..sheet.width {
+                    // Click a header to sort: ascending → descending → original order.
+                    let mut header_cell = |h: &mut egui_extras::TableRow, by: SortBy, title: String, color: Option<Color32>| {
+                        let arrow = match sort {
+                            Some((s, true)) if s == by => " ▲",
+                            Some((s, false)) if s == by => " ▼",
+                            _ => "",
+                        };
+                        let next = match sort {
+                            Some((s, true)) if s == by => "descending",
+                            Some((s, false)) if s == by => "the original order",
+                            _ => "ascending",
+                        };
                         h.col(|ui| {
                             ui.add_space(6.0);
-                            ui.add(egui::Label::new(RichText::new(column_title(c)).strong()).truncate())
-                                .on_hover_text(format!("Column {}", sheet.column_letter(c)));
+                            let mut text = RichText::new(format!("{title}{arrow}")).strong();
+                            if let Some(c) = color {
+                                text = text.color(c);
+                            }
+                            let hover = match by {
+                                SortBy::Row => format!("Sort by row number ({next})"),
+                                SortBy::Column(c) => format!("Column {} — click to sort {next}", sheet.column_letter(c)),
+                            };
+                            if ui.add(egui::Button::new(text).frame(false).truncate()).on_hover_text(hover).clicked() {
+                                sort_click = Some(by);
+                            }
                         });
+                    };
+                    header_cell(&mut h, SortBy::Row, "Row".to_string(), Some(muted));
+                    for c in 0..gw {
+                        header_cell(&mut h, SortBy::Column(c), column_title(c), None);
                     }
                 })
                 .body(|body| {
@@ -1073,8 +1487,9 @@ impl SortsiteEval {
                                 ui.add(egui::Label::new(RichText::new(s.label()).strong()).selectable(false));
                             }
                         });
-                        for c in 0..sheet.width {
-                            let text = sheet.rows[r].get(c).map(String::as_str).unwrap_or("");
+                        for c in 0..gw {
+                            let owned = cell_text(r, c);
+                            let text = owned.as_str();
                             row.col(|ui| {
                                 paint_cell(ui, status, selected);
                                 ui.add_space(6.0);
@@ -1101,6 +1516,9 @@ impl SortsiteEval {
         });
         if let Some(r) = clicked_row {
             self.selected_row = if self.selected_row == Some(r) { None } else { Some(r) };
+        }
+        if let Some(by) = sort_click {
+            self.cycle_sort(by);
         }
     }
 }
@@ -1189,6 +1607,105 @@ mod tests {
         let restricted = outcome(Kind::Restricted, Some(403), "https://x/", None);
         assert!(!restricted.works(), "a 403 is not proof the link is fixed");
         assert_eq!(restricted.message().1, Tone::Warn);
+
+        // What each result marks the row as.
+        assert_eq!(outcome(Kind::Ok, Some(200), "https://x/", None).verdict(), Some(Status::Fixed));
+        assert_eq!(outcome(Kind::Broken, Some(404), "https://x/", None).verdict(), Some(Status::Broken));
+        assert_eq!(outcome(Kind::Error, None, "https://x/", None).verdict(), Some(Status::Broken), "DNS/connection failure");
+        let mut timeout = outcome(Kind::Error, None, "https://x/", None);
+        timeout.result.reason = "Timed out".into();
+        assert_eq!(timeout.verdict(), None, "a timeout proves nothing either way");
+        assert_eq!(timeout.message().1, Tone::Warn);
+        assert_eq!(missing_anchor.verdict(), Some(Status::Broken));
+        assert_eq!(restricted.verdict(), None, "a refused check proves nothing either way");
+        assert_eq!(outcome(Kind::Ok, Some(200), "https://x/#a", Some(Err("timeout".into()))).verdict(), None);
+        assert!(outcome(Kind::Broken, Some(404), "https://x/", None).message().0.ends_with("marked Broken."));
+    }
+
+    fn sheet_of(rows: &[&[&str]]) -> Sheet {
+        let rows: Vec<Vec<String>> = rows.iter().map(|r| strings(r)).collect();
+        let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+        Sheet { name: "s".into(), rows, width, first_row: 0, first_col: 0, error: None }
+    }
+
+    #[test]
+    fn compares_cells_naturally() {
+        use std::cmp::Ordering::*;
+        assert_eq!(compare_cells("9", "10"), Less, "numbers by value");
+        assert_eq!(compare_cells("2.5", "10"), Less);
+        assert_eq!(compare_cells("933 1018", "1173 1308"), Less, "SortSite Line values");
+        assert_eq!(compare_cells("Line 9", "Line 10"), Less);
+        assert_eq!(compare_cells("broken link", "Broken Link"), Equal, "case-insensitive");
+        assert_eq!(compare_cells("apple", "Banana"), Less);
+        assert_eq!(compare_cells("007", "7"), Equal, "leading zeros");
+        assert_eq!(compare_cells("WCAG 2.1 A 4.1.1", "WCAG 2.1 A F89"), Less);
+    }
+
+    #[test]
+    fn sorts_rows_with_empties_last_and_stable_ties() {
+        let sheet = sheet_of(&[&["Name", "Count"], &["b", "10"], &["a", ""], &["c", "9"], &["a", "9"]]);
+        let sorted = |by, asc| {
+            let mut rows: Vec<usize> = (1..sheet.rows.len()).collect();
+            sort_rows(&mut rows, by, asc, |r, c| sheet.rows[r].get(c).cloned().unwrap_or_default());
+            rows
+        };
+        assert_eq!(sorted(SortBy::Column(1), true), [3, 4, 1, 2], "9, 9, 10, then empty; tie keeps order");
+        assert_eq!(sorted(SortBy::Column(1), false), [1, 3, 4, 2], "10, 9, 9, empty still last");
+        assert_eq!(sorted(SortBy::Column(0), true), [2, 4, 1, 3], "a, a, b, c (stable)");
+        assert_eq!(sorted(SortBy::Row, false), [4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn notes_column_is_reused_or_added() {
+        let with = sheet_of(&[&["Guidelines", "Notes", "URL"], &["Broken Link", " checked ", "u"], &["x", "", "v"]]);
+        assert_eq!(notes_column(&with), (1, true));
+        assert_eq!(grid_width(&with), 3);
+        let without = sheet_of(&[&["Guidelines", "URL"], &["x", "u"]]);
+        assert_eq!(notes_column(&without), (2, false), "a new column after the last one");
+        assert_eq!(grid_width(&without), 3);
+        let wb = Workbook { path: "a-fixed.xlsx".into(), sheets: vec![with], original: None, saved_statuses: Statuses::new() };
+        let n = initial_notes(&wb);
+        assert_eq!(n["s"].get(&2).map(String::as_str), Some("checked"), "existing notes are loaded (Excel row 2)");
+        assert_eq!(n["s"].len(), 1, "blank notes are skipped");
+    }
+
+    #[test]
+    fn header_clicks_cycle_and_reset_per_sheet() {
+        let mut s = SortsiteEval::default();
+        s.cycle_sort(SortBy::Column(2));
+        assert_eq!(s.sort, Some((SortBy::Column(2), true)));
+        s.cycle_sort(SortBy::Column(2));
+        assert_eq!(s.sort, Some((SortBy::Column(2), false)));
+        s.cycle_sort(SortBy::Column(2));
+        assert_eq!(s.sort, None);
+        s.cycle_sort(SortBy::Column(1));
+        s.cycle_sort(SortBy::Column(3));
+        assert_eq!(s.sort, Some((SortBy::Column(3), true)), "another column starts ascending");
+        s.select_sheet(5);
+        assert_eq!(s.sort, None, "switching worksheets resets the sort");
+    }
+
+    #[test]
+    fn finds_the_page_url_for_ada_check() {
+        let header = strings(&["Guidelines", "Detail", "URL", "Target URL"]);
+        assert_eq!(
+            page_url_column(&header, &strings(&["Broken Link", "x", " https://library.louisville.edu/art/ ", "https://t.example/"])),
+            Some((2, "https://library.louisville.edu/art/".into())),
+            "the URL column, not Target URL"
+        );
+        assert_eq!(page_url_column(&header, &strings(&["WCAG 2.1 A 4.1.1", "x", "", ""])), None, "empty");
+        assert_eq!(page_url_column(&header, &strings(&["a", "b", "not a url", ""])), None);
+        assert_eq!(page_url_column(&strings(&["Priority", "Target URL"]), &strings(&["1", "https://t/"])), None, "no URL column");
+    }
+
+    #[test]
+    fn fixed_files_save_without_asking() {
+        use std::path::Path;
+        assert!(saves_in_place(Path::new("/d/ada-fixed.xlsx")));
+        assert!(saves_in_place(Path::new("/d/report-fixed.xlsm")));
+        assert!(!saves_in_place(Path::new("/d/ada.xlsx")), "originals still ask first");
+        assert!(!saves_in_place(Path::new("/d/ada-fixed.xls")), "can't be saved, so no autosave");
+        assert!(!saves_in_place(Path::new("/d/ada-fixed-notes.xlsx")), "suffix must be at the end");
     }
 
     #[test]

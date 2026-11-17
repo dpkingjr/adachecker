@@ -72,6 +72,12 @@ pub struct LinkResult {
 }
 
 impl LinkResult {
+    /// No response because the request timed out — not proof the link is broken (the site
+    /// may be slow, or only reachable on another network).
+    pub fn timed_out(&self) -> bool {
+        self.kind == Kind::Error && self.reason.starts_with("Timed out")
+    }
+
     /// "404 Not Found", or the error text when there was no response.
     pub fn status_text(&self) -> String {
         match self.status {
@@ -149,9 +155,18 @@ pub fn parse_links(text: &str) -> Parsed {
     out
 }
 
+/// Headers a browser sends; some servers answer differently (e.g. 406) without them.
+fn browser_headers() -> header::HeaderMap {
+    let mut h = header::HeaderMap::new();
+    h.insert(header::ACCEPT, header::HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"));
+    h.insert(header::ACCEPT_LANGUAGE, header::HeaderValue::from_static("en-US,en;q=0.9"));
+    h
+}
+
 pub fn build_client() -> reqwest::Result<Client> {
     Client::builder()
         .user_agent(USER_AGENT)
+        .default_headers(browser_headers())
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
@@ -160,7 +175,9 @@ pub fn build_client() -> reqwest::Result<Client> {
 
 fn classify(status: StatusCode, redirected: bool) -> Kind {
     match status.as_u16() {
-        401 | 403 | 407 | 429 => Kind::Restricted,
+        // The server refused an automated request; the link may still work in a browser.
+        // 417 is what Microsoft 365 sends non-browsers; 999 is LinkedIn's bot block.
+        401 | 403 | 407 | 417 | 429 | 999 => Kind::Restricted,
         400..=599 => Kind::Broken,
         _ if redirected => Kind::Redirected,
         _ => Kind::Ok,
@@ -246,7 +263,7 @@ pub fn check(client: &Client, link: &str) -> LinkResult {
 }
 
 /// Decodes `%XX` escapes (as in URL fragments) into text.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -263,12 +280,19 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Whether a URL fragment names an element (an anchor to check), rather than a JavaScript
+/// app route (`#!/…`, `#/…`), a PDF/media parameter (`#page=5`) or a text fragment
+/// (`#:~:text=…`).
+pub(crate) fn is_element_fragment(f: &str) -> bool {
+    !f.is_empty() && !f.starts_with('!') && !f.starts_with(":~:") && !f.contains('/') && !f.contains('=')
+}
+
 /// For a link with a `#fragment`, loads the page and reports whether the target exists
 /// (an element with that `id`, or `<a name>`). `Ok(None)` when there is no fragment to
 /// check. `#top` always exists (browsers scroll to the top of any page).
 pub fn check_anchor(url: &str) -> Result<Option<bool>, String> {
     let parsed = Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
-    let Some(fragment) = parsed.fragment().map(percent_decode).filter(|f| !f.is_empty()) else { return Ok(None) };
+    let Some(fragment) = parsed.fragment().map(percent_decode).filter(|f| is_element_fragment(f)) else { return Ok(None) };
     if fragment.eq_ignore_ascii_case("top") {
         return Ok(Some(true));
     }
@@ -293,12 +317,12 @@ pub fn check_anchor(url: &str) -> Result<Option<bool>, String> {
 }
 
 /// A batch of links being checked on background threads.
-pub struct LinkRun {
-    pub rx: Receiver<(usize, LinkResult)>,
+pub struct LinkRun<T = LinkResult> {
+    pub rx: Receiver<(usize, T)>,
     cancel: Arc<AtomicBool>,
 }
 
-impl LinkRun {
+impl<T> LinkRun<T> {
     /// Stops handing out new links; requests already in flight finish on their own.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
@@ -308,24 +332,56 @@ impl LinkRun {
 /// Checks `links` with up to `CONCURRENCY` worker threads. Each result is sent with the
 /// link's index, and `notify` is called so the UI can repaint.
 pub fn start(links: Vec<String>, notify: Arc<dyn Fn() + Send + Sync>) -> LinkRun {
+    start_with(links, notify, check)
+}
+
+/// A link check that also verifies the `#fragment` target, for links that have one.
+#[derive(Clone, Debug)]
+pub struct CheckedLink {
+    pub result: LinkResult,
+    /// `Some` for links with a fragment whose page loaded: whether the anchor exists.
+    pub anchor: Option<Result<bool, String>>,
+}
+
+impl CheckedLink {
+    pub fn check(client: &Client, link: &str) -> CheckedLink {
+        let result = check(client, link);
+        let anchor = if matches!(result.kind, Kind::Ok | Kind::Redirected) {
+            match check_anchor(link) {
+                Ok(None) => None,
+                Ok(Some(found)) => Some(Ok(found)),
+                Err(e) => Some(Err(e)),
+            }
+        } else {
+            None
+        };
+        CheckedLink { result, anchor }
+    }
+}
+
+/// Like `start`, but each link is checked with `check_fn`.
+pub fn start_with<T, F>(links: Vec<String>, notify: Arc<dyn Fn() + Send + Sync>, check_fn: F) -> LinkRun<T>
+where
+    T: Send + 'static,
+    F: Fn(&Client, &str) -> T + Send + Sync + 'static,
+{
     let (tx, rx) = channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let workers = CONCURRENCY.min(links.len()).max(1);
     let queue = Arc::new(Mutex::new(links.into_iter().enumerate().collect::<VecDeque<_>>()));
-    let client = build_client().map_err(|e| e.to_string());
+    // Building the client only fails if TLS can't initialise; fall back to a default one.
+    let client = build_client().unwrap_or_else(|_| Client::new());
+    let check_fn = Arc::new(check_fn);
     for _ in 0..workers {
-        let (tx, cancel, queue, notify, client) = (tx.clone(), cancel.clone(), queue.clone(), notify.clone(), client.clone());
+        let (tx, cancel, queue, notify, client, check_fn) =
+            (tx.clone(), cancel.clone(), queue.clone(), notify.clone(), client.clone(), check_fn.clone());
         std::thread::spawn(move || loop {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
             let job = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
             let Some((i, link)) = job else { break };
-            let result = match &client {
-                Ok(c) => check(c, &link),
-                Err(e) => error_result(format!("Could not create HTTP client: {e}"), vec![], link.clone(), "-", Instant::now()),
-            };
-            if tx.send((i, result)).is_err() {
+            if tx.send((i, check_fn(&client, &link))).is_err() {
                 break;
             }
             notify();
@@ -407,6 +463,8 @@ mod tests {
         assert_eq!(classify(StatusCode::NOT_FOUND, true), Kind::Broken);
         assert_eq!(classify(StatusCode::FORBIDDEN, false), Kind::Restricted);
         assert_eq!(classify(StatusCode::TOO_MANY_REQUESTS, false), Kind::Restricted);
+        assert_eq!(classify(StatusCode::EXPECTATION_FAILED, false), Kind::Restricted, "Microsoft 365 bot block");
+        assert_eq!(classify(StatusCode::from_u16(999).unwrap(), false), Kind::Restricted, "LinkedIn bot block");
         assert_eq!(classify(StatusCode::SERVICE_UNAVAILABLE, false), Kind::Broken);
     }
 
@@ -515,6 +573,9 @@ mod tests {
         assert_eq!(anchor("top"), Ok(Some(true)));
         assert_eq!(check_anchor(&format!("{base}/moved#section-2")), Ok(Some(true)), "follows redirects");
         assert_eq!(check_anchor(&format!("{base}/page")), Ok(None), "no fragment");
+        for not_an_anchor in ["!/browse/book/3-s2.0", "/route", "page=5", ":~:text=hello"] {
+            assert_eq!(check_anchor(&format!("{base}/page#{not_an_anchor}")), Ok(None), "#{not_an_anchor} is not an element anchor");
+        }
         assert!(check_anchor(&format!("{base}/nope#x")).is_err(), "404 page is an error");
         assert_eq!(percent_decode("a%20b%zz"), "a b%zz");
         assert_eq!(percent_decode("x%é%4"), "x%é%4", "no panic on non-ASCII after %");

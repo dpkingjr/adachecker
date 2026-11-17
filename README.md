@@ -31,6 +31,27 @@ To install the app, drag it to `/Applications`. The bundle is built for the arch
 
 Enter a URL (the scheme is optional and defaults to `https://`) or an absolute local `.html` file path. Pick a WCAG version and level, then press **Scan** or Enter.
 
+## Checking the page's links
+
+Tick **Check links**, next to **Preview**, to also check every link on the scanned page. The app remembers the setting between launches. The check runs in the background after the scan, and a **Links** section above the WCAG results shows its progress and counts.
+
+What gets checked:
+
+- Every `<a href>` and `<area href>` on the page, resolved against the page address and any `<base href>`. `mailto:`, `tel:` and `javascript:` links are skipped.
+- Each address once, even if it's linked several times. Checks use the Link Checker's engine (`HEAD`, falling back to `GET`), 8 at a time.
+- **In-page links** (`#section`): checked straight away against the page itself.
+- **Links to other pages with a `#fragment`:** that page is loaded to confirm the anchor exists. App routes (`#!/…`, `#/…`), `#page=5` and `#:~:text=` aren't anchors and aren't checked as such.
+
+How results are grouped:
+
+| Result | Meaning |
+|---|---|
+| ✖ Broken | 4xx or 5xx, DNS or connection errors, or a missing anchor |
+| ⚠ Review | the server refused an automated check (401, 403, 407, 417, 429, 999), a timeout, or an anchor that couldn't be checked |
+| ✔ OK / ↪ Redirected | working; hidden unless you tick **Show working links** |
+
+**Click a link in the list** to highlight that `<a>` element in the page preview and the HTML source. Broken links aren't a WCAG success criterion, so they don't affect the conformance verdict.
+
 ## Page preview
 
 The right-hand panel shows the page in an embedded browser: WKWebView on macOS, through [`wry`](https://github.com/tauri-apps/wry). It starts loading as soon as you press **Scan**. Click a finding in the results list, or focus it with Tab and press Space, and the preview:
@@ -113,30 +134,56 @@ Select **Sortsite Eval** in the left-hand navigation. It has two tabs, both in t
     - URLs open in your browser.
     - Drag a column's edge to resize it.
     - **Filter rows** shows only rows that contain your text in any column.
+    - **Click a column heading to sort by it.** Each click moves through ascending (▲), descending (▼) and the original order. **Row** sorts by row number.
+      - Numbers sort by value, text ignores upper and lower case, and numbers inside text sort by value, so SortSite's Line values like "933 1018" come before "1173 1308".
+      - Empty cells always go last, and rows with equal values keep their original order.
+      - Sorting works together with the filter, and resets when you switch worksheets.
   - **Click a row** to open a details pane that lists every column of that row in full. You can select and copy the text.
     - Use **Dock: Below | Right | Left** in the pane's header to choose where it appears, like a browser's developer tools. Drag the pane's edge to resize it.
     - The app remembers your choice and uses the same side next time, including after a restart. It's saved as soon as you change it, in `~/Library/Application Support/ADA-Checker/app.ron`. Only this setting is stored there.
 
 ### Marking rows Fixed, On-Hold or N/A
 
-To mark a row, select it and choose a value from the **Status** dropdown in its details pane:
+To mark a row, select it and click one of the four **Status** buttons at the top of its details pane:
 
 | Status | Colour in the spreadsheet |
 |---|---|
 | **Fixed** | Green (Excel's "Good" colour) |
 | **On-Hold** | Yellow (Excel's "Neutral" colour) |
 | **N/A** | Grey |
+| **Broken** | Red (Excel's "Bad" colour) |
 
-**Clear status** removes the mark. In the app, the Row column also shows the status as text, so you don't have to rely on the colour.
+The button for the row's current status is highlighted. Click it again to clear the status. In the app, the Row column also shows the status as text, so you don't have to rely on the colour.
 
 How saving works:
 
-- **First change:** the app asks whether to save a copy named with a `-fixed` suffix, for example `ada.xlsx` → `ada-fixed.xlsx`. The copy goes in the same folder, and the original file is never changed. If a file with that name already exists, the prompt warns you that it will be replaced.
+- **First change to an original file:** the app asks whether to save a copy named with a `-fixed` suffix, for example `ada.xlsx` → `ada-fixed.xlsx`. The copy goes in the same folder, and the original file is never changed. If a file with that name already exists, the prompt warns you that it will be replaced.
 - **After you choose Save:** every later status change is saved to the `-fixed` file automatically. The bar above the grid shows when the save is done and has **Show in Finder**.
 - **If you choose Not now:** the changes stay in the app until you click **Save as …-fixed.xlsx** in the same bar.
-- **Opening a `-fixed` file:** the app reads its statuses from the row colours, and saves further changes back into that file.
+- **Opening a `-fixed` file:** the app reads its statuses from the row colours. It doesn't ask before saving: every status change is saved straight back into that file.
 
 Statuses can be saved for `.xlsx` and `.xlsm` files.
+
+### Notes
+
+Each row's details pane has a **Notes** box, under the Status buttons, for comments about the issue. The grid has a **Notes** column too, so you can filter rows by note text and sort by notes.
+
+- **Saving:** notes are saved to the spreadsheet like statuses, with the same first-change prompt and automatic saving.
+  - A note counts as changed when you leave the box. With automatic saving on, it also saves after a short pause in typing.
+  - The save prompt never appears while you're still typing.
+- **In the file:** every worksheet in the saved `-fixed` file gets a **Notes** column with a "Notes" header, placed after its last column and given a readable width.
+  - A sheet that already has a "Notes" column (for example a reopened `-fixed` file) reuses it. Other columns such as "TH Notes" aren't touched.
+  - Notes are written as plain text cells, and a row's status colour covers its Notes cell too.
+  - Clearing a note empties its cell.
+
+### Scanning a reported page (ADA Check)
+
+The details pane shows an **ADA Check** button beside the row's **URL** (the page SortSite reported the issue on). Clicking it:
+
+- switches to the **Accessibility Checker**
+- scans that page with the WCAG version and level currently selected there
+
+Sortsite Eval keeps its place, so switching back returns you to the same worksheet, row and filter. If a scan is already running, the new one starts as soon as it finishes.
 
 ### Re-checking broken links
 
@@ -147,21 +194,23 @@ When a selected row's **Guidelines** value is "Broken Link", its details pane sh
 
 The button checks the link in the background, using the Link Checker's engine. The result appears under the URL:
 
-- **Link works** (2xx, including after redirects): the row is marked **Fixed**, which saves just like choosing Fixed yourself.
-- **Still broken** (4xx, 5xx, DNS or connection errors): the row isn't changed.
-- **Server refused the check** (401, 403 or 429): the row isn't changed, because a site that blocks automated checks may still work in a browser.
+- **Link works** (2xx, including after redirects): the row is marked **Fixed**.
+- **Still broken** (4xx, 5xx, DNS or connection errors, or a missing anchor): the row is marked **Broken**.
+
+Either way, the result is the same as clicking that Status button yourself. It replaces any earlier status and is saved the same way.
+- **Server refused the check** (401, 403 or 429), or an anchor that couldn't be checked: the row isn't changed, because the check doesn't prove the link either works or is broken. A site that blocks automated checks may still work in a browser.
 
 Which link is checked:
 
 - The app takes the link from the **Target URL** column. If that's empty, it uses the first URL in **Detail**.
 - **Missing anchors:** for rows whose description says "The target anchor does not exist", SortSite leaves the `#fragment` off the Target URL and puts it in Detail as `id=…`. The app adds it back and checks that the anchor exists on the page, not just that the page loads.
-- **Any link with a `#fragment`:** the row is only marked Fixed if an element with that `id` or `name` is on the page.
+- **Any link with a `#fragment`:** the row is only marked Fixed if an element with that `id` or `name` is on the page. If the page loads but that element is missing, the row is marked Broken.
 
 You can check several rows at once, and each row keeps showing its result while the file is open.
 
 How the file is edited:
 
-- The app changes only the workbook's styles and the rows you marked. Everything else is copied unchanged: other worksheets, formulas, formatting, column widths, comments and document properties.
+- The app changes only the workbook's styles, the rows you marked or annotated, and each worksheet's Notes column. Everything else is copied unchanged: all other cell values, formulas, formatting, column widths, comments and document properties.
 - In a marked row, any empty cells inside the sheet's used range get the colour too, so the whole row is filled in any spreadsheet program.
 - Every save starts from the file as it was opened, so clearing a status removes its colour.
 - Saves are written to a temporary file that then replaces the target, so an interrupted save can't leave you with a damaged spreadsheet.

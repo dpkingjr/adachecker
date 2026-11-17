@@ -86,7 +86,7 @@ pub struct Locator {
     pub source: Option<std::ops::Range<usize>>,
 }
 
-fn locator(el: ElementRef) -> Locator {
+pub(crate) fn locator(el: ElementRef) -> Locator {
     let mut parts = Vec::new();
     let mut cur = Some(el);
     while let Some(e) = cur {
@@ -330,7 +330,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Visible text content of an element, including alt text of contained images,
 /// skipping subtrees hidden with aria-hidden="true".
-fn content_text(el: ElementRef) -> String {
+pub(crate) fn content_text(el: ElementRef) -> String {
     let mut out = String::new();
     collect_text(el, &mut out);
     collapse_ws(&out)
