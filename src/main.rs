@@ -4,12 +4,19 @@ mod link_checker_ui;
 mod links;
 mod preview;
 mod scanner;
+mod sortsite_ui;
 mod source;
+mod spreadsheet;
+mod xlsx_edit;
 
 use checks::{Level, Outcome, Severity, Version};
 use eframe::egui::{self, Color32, RichText};
 use code_view::{CodeView, Mark};
 use link_checker_ui::LinkChecker;
+use sortsite_ui::{DetailsSide, SortsiteEval};
+
+/// Settings-file key for where the Sortsite Eval row-details pane is docked.
+const DETAILS_SIDE_KEY: &str = "sortsite.details_side";
 use preview::Preview;
 use scanner::Report;
 use std::sync::mpsc::{channel, Receiver};
@@ -20,13 +27,26 @@ fn main() -> eframe::Result<()> {
             .with_title("ADA Checker")
             .with_inner_size([1500.0, 900.0])
             .with_min_inner_size([1000.0, 520.0]),
+        // Only explicitly saved settings persist (see `App::save`), not window geometry.
+        persist_window: false,
         ..Default::default()
     };
     eframe::run_native(
         "ADA Checker",
         options,
-        Box::new(|_cc| {
+        Box::new(|cc| {
             let mut app = App::default();
+            // Restore saved settings.
+            if let Some(side) = cc.storage.and_then(|s| s.get_string(DETAILS_SIDE_KEY)).and_then(|v| DetailsSide::parse(&v)) {
+                app.sortsite.set_details_side(side);
+            }
+            // Debug builds only: ADA_CHOOSE_SIDE=right acts as if the user then picked that
+            // dock side (applied after restoring, like a real click would be).
+            if cfg!(debug_assertions) {
+                if let Some(side) = std::env::var("ADA_CHOOSE_SIDE").ok().and_then(|v| DetailsSide::parse(&v)) {
+                    app.sortsite.choose_details_side(side);
+                }
+            }
             // Optional URL argument: `adachecker https://example.com` scans on launch.
             // (macOS may pass a `-psn_…` process-serial argument when launched from Finder.)
             if let Some(url) = std::env::args().skip(1).find(|a| !a.starts_with("-psn")) {
@@ -43,6 +63,7 @@ fn main() -> eframe::Result<()> {
 enum Tool {
     Accessibility,
     Links,
+    Sortsite,
 }
 
 /// Where a selection came from. Selecting in one view reveals the element in the other.
@@ -69,6 +90,7 @@ enum ScanState {
 struct App {
     tool: Tool,
     link_checker: LinkChecker,
+    sortsite: SortsiteEval,
     url: String,
     version: Version,
     level: Level,
@@ -100,10 +122,35 @@ impl Default for App {
         Self {
             // Debug builds only: ADA_TOOL=links opens the Link Checker, and ADA_LINKS_FILE=path
             // pre-fills it from a file and starts checking (for testing).
-            tool: if cfg!(debug_assertions) && std::env::var("ADA_TOOL").as_deref() == Ok("links") {
-                Tool::Links
-            } else {
-                Tool::Accessibility
+            tool: match std::env::var("ADA_TOOL").as_deref() {
+                Ok("links") if cfg!(debug_assertions) => Tool::Links,
+                Ok("sortsite") if cfg!(debug_assertions) => Tool::Sortsite,
+                _ => Tool::Accessibility,
+            },
+            // Debug builds only: ADA_XLSX=path opens that spreadsheet on launch (for testing).
+            sortsite: {
+                let mut s = SortsiteEval::default();
+                if cfg!(debug_assertions) {
+                    if let Some(p) = std::env::var_os("ADA_XLSX") {
+                        s.request_open(p.into());
+                        // ADA_XLSX_SHEET=n / ADA_XLSX_ROW=n select a worksheet / row (0-based).
+                        let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok());
+                        if let Some(sheet) = num("ADA_XLSX_SHEET") {
+                            s.preselect(sheet, num("ADA_XLSX_ROW"));
+                        }
+                        // ADA_SET_STATUS=fixed|onhold|na sets it on that row; ADA_ACCEPT_SAVE=1
+                        // answers "Save" to the prompt.
+                        let status = match std::env::var("ADA_SET_STATUS").as_deref() {
+                            Ok("fixed") => Some(xlsx_edit::Status::Fixed),
+                            Ok("onhold") => Some(xlsx_edit::Status::OnHold),
+                            Ok("na") => Some(xlsx_edit::Status::NotApplicable),
+                            _ => None,
+                        };
+                        // ADA_CHECK_LINK=1 presses "Check Link" on that row.
+                        s.debug_actions(status, std::env::var_os("ADA_ACCEPT_SAVE").is_some(), std::env::var_os("ADA_CHECK_LINK").is_some());
+                    }
+                }
+                s
             },
             link_checker: {
                 let mut lc = LinkChecker::default();
@@ -673,6 +720,7 @@ impl App {
         for (tool, title, subtitle) in [
             (Tool::Accessibility, "Accessibility Checker", "Scan a page for WCAG issues"),
             (Tool::Links, "Link Checker", "Find broken links in a list"),
+            (Tool::Sortsite, "Sortsite Eval", "Review a SortSite Excel report"),
         ] {
             if nav_tab(ui, self.tool == tool, title, subtitle).clicked() {
                 self.tool = tool;
@@ -744,6 +792,15 @@ impl App {
     }}
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(DETAILS_SIDE_KEY, self.sortsite.details_side().as_str().to_string());
+    }
+
+    /// Only our own settings are saved, not egui's internal UI state.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         // Keep polling the scan so it completes even while another tool is shown.
         self.poll();
@@ -757,6 +814,19 @@ impl eframe::App for App {
                 // The page preview is a native view drawn over egui; keep it out of the way.
                 self.preview.hide();
                 self.link_checker.ui(ui);
+            }
+            Tool::Sortsite => {
+                self.preview.hide();
+                self.sortsite.ui(ui);
+            }
+        }
+        // Finish loading a spreadsheet even while another tool is shown.
+        self.sortsite.frame(ui.ctx());
+        // Save a new dock-side choice immediately (not just on quit), so it survives a crash.
+        if self.sortsite.take_details_side_changed() {
+            if let Some(storage) = frame.storage_mut() {
+                storage.set_string(DETAILS_SIDE_KEY, self.sortsite.details_side().as_str().to_string());
+                storage.flush();
             }
         }
     }

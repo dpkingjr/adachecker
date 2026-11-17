@@ -1,6 +1,10 @@
 # ADA Checker
 
-A Rust desktop app (egui/eframe) with two tools. The **Accessibility Checker** scans a web page for WCAG 2.0, 2.1 or 2.2 compliance at Level A, AA or AAA. The **Link Checker** checks a pasted list of links and reports which ones are broken.
+A Rust desktop app (egui/eframe) with three tools:
+
+- The **Accessibility Checker** scans a web page for WCAG 2.0, 2.1 or 2.2 compliance at Level A, AA or AAA.
+- The **Link Checker** checks a pasted list of links and reports which ones are broken.
+- **Sortsite Eval** opens a SortSite report exported to Excel, so you can browse its worksheets.
 
 ## Run
 
@@ -96,6 +100,74 @@ How links are checked:
 - **Show only problems** filters the table.
 - **Copy as CSV** copies the results for a spreadsheet.
 
+## Sortsite Eval
+
+Select **Sortsite Eval** in the left-hand navigation. It has two tabs, both in the main window:
+
+- **Open file:** press **Browse for Excel spreadsheet…** and choose a SortSite report that has been exported to Excel. The app reads `.xlsx`, `.xlsm`, `.xlsb`, `.xls` and `.ods` files, using [calamine](https://github.com/tafia/calamine). Once a file is open, this tab shows a summary of it. Click a worksheet in the summary to view it.
+- **Worksheets:** opens automatically when a file has loaded.
+  - **Left:** a list of every worksheet, with its number of rows and columns. Click a worksheet to show it, or move between worksheets with the ↑ and ↓ keys.
+  - **Right:** a grid showing all of the selected worksheet's columns, with Excel row numbers.
+    - The first row is used for column names. Untick **First row contains column names** to use the letters A, B, C… instead.
+    - Long text is shortened in the grid; hover over a cell to read all of it.
+    - URLs open in your browser.
+    - Drag a column's edge to resize it.
+    - **Filter rows** shows only rows that contain your text in any column.
+  - **Click a row** to open a details pane that lists every column of that row in full. You can select and copy the text.
+    - Use **Dock: Below | Right | Left** in the pane's header to choose where it appears, like a browser's developer tools. Drag the pane's edge to resize it.
+    - The app remembers your choice and uses the same side next time, including after a restart. It's saved as soon as you change it, in `~/Library/Application Support/ADA-Checker/app.ron`. Only this setting is stored there.
+
+### Marking rows Fixed, On-Hold or N/A
+
+To mark a row, select it and choose a value from the **Status** dropdown in its details pane:
+
+| Status | Colour in the spreadsheet |
+|---|---|
+| **Fixed** | Green (Excel's "Good" colour) |
+| **On-Hold** | Yellow (Excel's "Neutral" colour) |
+| **N/A** | Grey |
+
+**Clear status** removes the mark. In the app, the Row column also shows the status as text, so you don't have to rely on the colour.
+
+How saving works:
+
+- **First change:** the app asks whether to save a copy named with a `-fixed` suffix, for example `ada.xlsx` → `ada-fixed.xlsx`. The copy goes in the same folder, and the original file is never changed. If a file with that name already exists, the prompt warns you that it will be replaced.
+- **After you choose Save:** every later status change is saved to the `-fixed` file automatically. The bar above the grid shows when the save is done and has **Show in Finder**.
+- **If you choose Not now:** the changes stay in the app until you click **Save as …-fixed.xlsx** in the same bar.
+- **Opening a `-fixed` file:** the app reads its statuses from the row colours, and saves further changes back into that file.
+
+Statuses can be saved for `.xlsx` and `.xlsm` files.
+
+### Re-checking broken links
+
+When a selected row's **Guidelines** value is "Broken Link", its details pane shows a **Check Link** button beside the URL it will check:
+
+- docked **Below:** on the same line as the URL
+- docked **Right** or **Left:** beside the field's name, with the URL underneath
+
+The button checks the link in the background, using the Link Checker's engine. The result appears under the URL:
+
+- **Link works** (2xx, including after redirects): the row is marked **Fixed**, which saves just like choosing Fixed yourself.
+- **Still broken** (4xx, 5xx, DNS or connection errors): the row isn't changed.
+- **Server refused the check** (401, 403 or 429): the row isn't changed, because a site that blocks automated checks may still work in a browser.
+
+Which link is checked:
+
+- The app takes the link from the **Target URL** column. If that's empty, it uses the first URL in **Detail**.
+- **Missing anchors:** for rows whose description says "The target anchor does not exist", SortSite leaves the `#fragment` off the Target URL and puts it in Detail as `id=…`. The app adds it back and checks that the anchor exists on the page, not just that the page loads.
+- **Any link with a `#fragment`:** the row is only marked Fixed if an element with that `id` or `name` is on the page.
+
+You can check several rows at once, and each row keeps showing its result while the file is open.
+
+How the file is edited:
+
+- The app changes only the workbook's styles and the rows you marked. Everything else is copied unchanged: other worksheets, formulas, formatting, column widths, comments and document properties.
+- In a marked row, any empty cells inside the sheet's used range get the colour too, so the whole row is filled in any spreadsheet program.
+- Every save starts from the file as it was opened, so clearing a status removes its colour.
+- Saves are written to a temporary file that then replaces the target, so an interrupted save can't leave you with a damaged spreadsheet.
+
+The editing code is in `src/xlsx_edit.rs`.
+
 ## What it checks
 
 You can scan against **WCAG 2.0, 2.1, or 2.2** at Level **A, AA, or AAA**. The app defaults to WCAG 2.1 AA, the standard the ADA Title II rule refers to. Each rule is tagged with the WCAG version that introduced its success criterion. A scan runs only the rules that exist in the version you choose. Results for criteria added after 2.0 are labelled "new in 2.1" or "new in 2.2".
@@ -127,5 +199,6 @@ Rules are defined in the `RULES` table in `src/checks.rs`. To add a check, write
 ```sh
 cargo test                       # unit tests
 SCAN_FILE=page.html cargo test alignment_coverage -- --ignored --nocapture   # DOM-to-source mapping on a saved page
+XLSX_ORIGINAL=a.xlsx XLSX_SAVED=a-fixed.xlsx cargo test compare_saved_file -- --ignored --nocapture   # data identical, statuses saved
 SCAN_URL=https://example.com cargo test -- --ignored --nocapture   # live scan, WCAG 2.1 AA
 ```

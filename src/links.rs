@@ -5,6 +5,7 @@
 //! reports. Redirects are followed manually so the full chain can be shown.
 
 use reqwest::blocking::Client;
+use scraper::{Html, Selector};
 use reqwest::{header, Method, StatusCode};
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -244,6 +245,53 @@ pub fn check(client: &Client, link: &str) -> LinkResult {
     }
 }
 
+/// Decodes `%XX` escapes (as in URL fragments) into text.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit() {
+            let v = u8::from_str_radix(&s[i + 1..i + 3], 16).expect("two hex digits");
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// For a link with a `#fragment`, loads the page and reports whether the target exists
+/// (an element with that `id`, or `<a name>`). `Ok(None)` when there is no fragment to
+/// check. `#top` always exists (browsers scroll to the top of any page).
+pub fn check_anchor(url: &str) -> Result<Option<bool>, String> {
+    let parsed = Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
+    let Some(fragment) = parsed.fragment().map(percent_decode).filter(|f| !f.is_empty()) else { return Ok(None) };
+    if fragment.eq_ignore_ascii_case("top") {
+        return Ok(Some(true));
+    }
+    // Unlike `build_client`, follow redirects: we want the page the browser would land on.
+    let client = Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let body = client
+        .get(parsed)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.text())
+        .map_err(|e| describe(&e))?;
+    let doc = Html::parse_document(&body);
+    let sel = |s: &str| Selector::parse(s).expect("valid selector");
+    let found = doc.select(&sel("[id]")).any(|e| e.value().attr("id") == Some(fragment.as_str()))
+        || doc.select(&sel("a[name]")).any(|e| e.value().attr("name") == Some(fragment.as_str()));
+    Ok(Some(found))
+}
+
 /// A batch of links being checked on background threads.
 pub struct LinkRun {
     pub rx: Receiver<(usize, LinkResult)>,
@@ -400,8 +448,14 @@ mod tests {
                     .unwrap_or(("404 Not Found", ""));
                 // "/head-broken" rejects HEAD but serves GET.
                 let status = if path == "/head-broken" && method == "HEAD" { "405 Method Not Allowed" } else { status };
+                // "/page" serves a document with a few anchors.
+                let body = if route == "/page" && method == "GET" {
+                    r#"<html><body><div id="section-2">x</div><a name="old-style"></a><p id="caf&#233;">y</p></body></html>"#
+                } else {
+                    ""
+                };
                 let mut s = stream;
-                let _ = write!(s, "HTTP/1.1 {status}\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = write!(s, "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             }
         });
         (base, log)
@@ -448,6 +502,22 @@ mod tests {
 
         assert_eq!(check(&client, "ftp://example.com/x").kind, Kind::Error);
         assert!(log.lock().unwrap().iter().any(|l| l == "HEAD /ok"));
+    }
+
+    #[test]
+    fn checks_anchors() {
+        let (base, _) = serve(vec![("/page", "200 OK", ""), ("/moved", "301 Moved Permanently", "Location: /page\r\n")]);
+        let anchor = |f: &str| check_anchor(&format!("{base}/page#{f}"));
+        assert_eq!(anchor("section-2"), Ok(Some(true)));
+        assert_eq!(anchor("old-style"), Ok(Some(true)), "<a name> targets count");
+        assert_eq!(anchor("caf%C3%A9"), Ok(Some(true)), "percent-encoded fragment");
+        assert_eq!(anchor("missing"), Ok(Some(false)));
+        assert_eq!(anchor("top"), Ok(Some(true)));
+        assert_eq!(check_anchor(&format!("{base}/moved#section-2")), Ok(Some(true)), "follows redirects");
+        assert_eq!(check_anchor(&format!("{base}/page")), Ok(None), "no fragment");
+        assert!(check_anchor(&format!("{base}/nope#x")).is_err(), "404 page is an error");
+        assert_eq!(percent_decode("a%20b%zz"), "a b%zz");
+        assert_eq!(percent_decode("x%é%4"), "x%é%4", "no panic on non-ASCII after %");
     }
 
     #[test]
