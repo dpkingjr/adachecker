@@ -365,9 +365,18 @@ where
     T: Send + 'static,
     F: Fn(&Client, &str) -> T + Send + Sync + 'static,
 {
+    start_pool(links, CONCURRENCY, notify, check_fn)
+}
+
+/// Like `start_with`, with at most `workers` jobs running at once.
+pub fn start_pool<T, F>(links: Vec<String>, workers: usize, notify: Arc<dyn Fn() + Send + Sync>, check_fn: F) -> LinkRun<T>
+where
+    T: Send + 'static,
+    F: Fn(&Client, &str) -> T + Send + Sync + 'static,
+{
     let (tx, rx) = channel();
     let cancel = Arc::new(AtomicBool::new(false));
-    let workers = CONCURRENCY.min(links.len()).max(1);
+    let workers = workers.min(links.len()).max(1);
     let queue = Arc::new(Mutex::new(links.into_iter().enumerate().collect::<VecDeque<_>>()));
     // Building the client only fails if TLS can't initialise; fall back to a default one.
     let client = build_client().unwrap_or_else(|_| Client::new());
@@ -391,7 +400,7 @@ where
 }
 
 /// Quotes a CSV field when needed.
-fn csv(field: &str) -> String {
+pub(crate) fn csv(field: &str) -> String {
     if field.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", field.replace('"', "\"\""))
     } else {

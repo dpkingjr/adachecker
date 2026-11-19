@@ -1,3 +1,4 @@
+mod batch;
 mod checks;
 mod code_view;
 mod link_checker_ui;
@@ -11,6 +12,7 @@ mod xlsx_edit;
 
 use checks::{Level, Outcome, Severity, Version};
 use eframe::egui::{self, Color32, RichText};
+use batch::BatchScan;
 use code_view::{CodeView, Mark};
 use link_checker_ui::LinkChecker;
 use sortsite_ui::{DetailsSide, SortsiteEval};
@@ -91,6 +93,13 @@ enum Origin {
     Source,
 }
 
+/// WCAG Scanner input: one address, or a list of pages.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanMode {
+    Single,
+    List,
+}
+
 /// The tabs of the results area.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ResultsTab {
@@ -112,6 +121,13 @@ enum ScanState {
 }
 
 struct App {
+    scan_mode: ScanMode,
+    /// "List of pages" scanning.
+    batch: BatchScan,
+    /// The list page whose full results are shown in the one-page view, if any.
+    viewing_batch: Option<usize>,
+    /// Debug builds only: ADA_OPEN_BATCH=n opens list page n once it has been scanned.
+    debug_open_batch: Option<usize>,
     tool: Tool,
     link_checker: LinkChecker,
     sortsite: SortsiteEval,
@@ -166,6 +182,7 @@ impl Default for App {
             tool: match std::env::var("ADA_TOOL").as_deref() {
                 Ok("links") if cfg!(debug_assertions) => Tool::Links,
                 Ok("sortsite") if cfg!(debug_assertions) => Tool::Sortsite,
+                Ok("scanner") if cfg!(debug_assertions) => Tool::Accessibility,
                 // The app opens on Sortsite Eval.
                 _ => Tool::Sortsite,
             },
@@ -218,6 +235,19 @@ impl Default for App {
                 }
                 lc
             },
+            // Debug builds only: ADA_SCAN_LIST=file pre-fills the list and scans it.
+            scan_mode: if cfg!(debug_assertions) && std::env::var_os("ADA_SCAN_LIST").is_some() { ScanMode::List } else { ScanMode::Single },
+            batch: {
+                let mut b = BatchScan::default();
+                if cfg!(debug_assertions) {
+                    if let Some(text) = std::env::var_os("ADA_SCAN_LIST").and_then(|p| std::fs::read_to_string(p).ok()) {
+                        b.load(text, true);
+                    }
+                }
+                b
+            },
+            viewing_batch: None,
+            debug_open_batch: if cfg!(debug_assertions) { std::env::var("ADA_OPEN_BATCH").ok().and_then(|v| v.parse().ok()) } else { None },
             url: String::new(),
             // WCAG 2.1 AA is the standard referenced by the ADA Title II rule.
             version: Version::V2_1,
@@ -633,24 +663,54 @@ impl App {
     fn controls(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.heading("WCAG Compliance Scanner");
-        ui.label("Enter a web page address, choose a WCAG version and conformance level, and press Scan.");
+        ui.label("Scan one web page, or a list of pages, for a WCAG version and conformance level.");
         ui.add_space(6.0);
+        let mut back = false;
+        ui.horizontal(|ui| {
+            ui.label("Scan:");
+            if ui.selectable_label(self.scan_mode == ScanMode::Single, RichText::new("One page").strong()).clicked() {
+                self.scan_mode = ScanMode::Single;
+                self.viewing_batch = None;
+            }
+            let list_label = match self.batch.len() {
+                0 => "List of pages".to_string(),
+                n => format!("List of pages ({n})"),
+            };
+            if ui.selectable_label(self.scan_mode == ScanMode::List, RichText::new(list_label).strong()).clicked() {
+                self.scan_mode = ScanMode::List;
+                self.viewing_batch = None;
+            }
+            if let (ScanMode::List, Some(i)) = (self.scan_mode, self.viewing_batch) {
+                ui.separator();
+                if ui.button("← Back to list").clicked() {
+                    back = true;
+                }
+                ui.label(RichText::new(format!("Page {} of {}", i + 1, self.batch.len())).small());
+            }
+        });
+        if back {
+            self.viewing_batch = None;
+        }
+        ui.add_space(4.0);
+        let single = self.scan_mode == ScanMode::Single;
 
         let mut trigger = false;
         ui.horizontal(|ui| {
-            let label = ui.label("URL:");
             let scanning = self.is_scanning();
-            let width = (ui.available_width() - 500.0).max(160.0);
-            let edit = ui
-                .add_enabled(
-                    !scanning,
-                    egui::TextEdit::singleline(&mut self.url)
-                        .hint_text("https://example.com")
-                        .desired_width(width),
-                )
-                .labelled_by(label.id);
-            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                trigger = true;
+            if single {
+                let label = ui.label("URL:");
+                let width = (ui.available_width() - 500.0).max(160.0);
+                let edit = ui
+                    .add_enabled(
+                        !scanning,
+                        egui::TextEdit::singleline(&mut self.url)
+                            .hint_text("https://example.com")
+                            .desired_width(width),
+                    )
+                    .labelled_by(label.id);
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    trigger = true;
+                }
             }
 
             let ver_label = ui.label("WCAG:");
@@ -687,12 +747,14 @@ impl App {
                 .response
                 .labelled_by(lvl_label.id);
 
-            let scan_btn = ui.add_enabled(
-                !scanning && !self.url.trim().is_empty(),
-                egui::Button::new(RichText::new("  Scan  ").strong()),
-            );
-            if scan_btn.clicked() {
-                trigger = true;
+            if single {
+                let scan_btn = ui.add_enabled(
+                    !scanning && !self.url.trim().is_empty(),
+                    egui::Button::new(RichText::new("  Scan  ").strong()),
+                );
+                if scan_btn.clicked() {
+                    trigger = true;
+                }
             }
             ui.checkbox(&mut self.show_preview, "Preview")
                 .on_hover_text("Show the page preview and HTML source panel, highlighting the selected finding");
@@ -1078,7 +1140,7 @@ impl App {
         ui.add_space(6.0);
         for (tool, title, subtitle) in [
             (Tool::Sortsite, "Sortsite Eval", "Review a SortSite Excel report"),
-            (Tool::Accessibility, "WCAG Scanner", "Scan a page for WCAG issues"),
+            (Tool::Accessibility, "WCAG Scanner", "Scan pages for WCAG issues"),
             (Tool::Links, "Link Checker", "Find broken links in a list"),
         ] {
             if nav_tab(ui, self.tool == tool, title, subtitle).clicked() {
@@ -1093,7 +1155,39 @@ impl App {
     }
 
     /// The WCAG Scanner tool (URL scanner, results, preview and source).
+    /// Shows list page `i`'s full results in the one-page view (preview, source, links).
+    fn open_batch_report(&mut self, i: usize, ctx: &egui::Context) {
+        let Some(report) = self.batch.report(i).cloned() else { return };
+        self.viewing_batch = Some(i);
+        self.url = report.final_url.clone();
+        self.rx = None;
+        self.cancel_link_check();
+        self.selected = None;
+        self.code_view.clear();
+        self.results_tab = ResultsTab::Wcag;
+        let url = report.final_url.clone();
+        self.state = ScanState::Done(report);
+        self.publish_marks();
+        if let Ok(u) = scanner::normalize_url(&url) {
+            self.preview.navigate(u);
+        }
+        if self.check_links {
+            self.start_link_check(ctx);
+        }
+    }
+
     fn accessibility_ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        if self.scan_mode == ScanMode::List && self.viewing_batch.is_none() {
+            // The list view: the pasted pages and a summary row per page.
+            egui::Panel::top("controls").show(ui, |ui| self.controls(ui));
+            self.preview.hide();
+            match self.batch.ui(ui, self.version, self.level) {
+                Some(batch::Action::Start) => self.batch.start(self.version, self.level, ui.ctx()),
+                Some(batch::Action::Open(i)) => self.open_batch_report(i, ui.ctx()),
+                None => {}
+            }
+            return;
+        }
         egui::Panel::top("controls").show(ui, |ui| {
             self.controls(ui);
             self.summary(ui);
@@ -1198,10 +1292,22 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        // Keep polling the scan so it completes even while another tool is shown.
+        // Keep polling the scans so they complete even while another tool is shown.
         self.poll(ui.ctx());
+        self.batch.poll();
+        if self.batch.take_autostart() {
+            self.batch.start(self.version, self.level, ui.ctx());
+        }
+        if let Some(i) = self.debug_open_batch {
+            if self.batch.report(i).is_some() {
+                self.debug_open_batch = None;
+                self.open_batch_report(i, ui.ctx());
+            }
+        }
         // "ADA Check" in Sortsite Eval: scan that page and show the WCAG Scanner.
         if let Some(url) = self.sortsite.take_ada_check_request() {
+            self.scan_mode = ScanMode::Single;
+            self.viewing_batch = None;
             self.url = url;
             self.tool = Tool::Accessibility;
             self.scan_on_start = true;

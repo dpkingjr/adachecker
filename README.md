@@ -31,6 +31,24 @@ To install the app, drag it to `/Applications`. The bundle is built for the arch
 
 Enter a URL (the scheme is optional and defaults to `https://`) or an absolute local `.html` file path. Pick a WCAG version and level, then press **Scan** or Enter.
 
+## Scanning a list of pages
+
+Choose **Scan: List of pages** at the top of the WCAG Scanner to scan many pages in one go.
+
+- **Entering pages:** paste the addresses into the left pane. As in the Link Checker:
+  - you can paste one per line, and addresses without `https://` work too
+  - addresses inside text, Markdown or HTML are picked out
+  - lines starting with `#` are ignored, and duplicates are skipped
+- **Scanning:** press **Scan N pages**. The pages are scanned with the WCAG version and level selected above, 4 at a time, and **Stop** cancels the run.
+- **Results:** a table with one row per page:
+  - **Result:** ✖ Fails, ⚠ Needs review, ✔ No failures, or ✖ Couldn't scan with the reason
+  - **Failed:** the number of WCAG criteria failed
+  - **Errors** and **Warnings**
+  - **Page title** and **Address**
+
+  **Only pages with problems** filters the table, and **Copy as CSV** copies one line per page for a spreadsheet.
+- **Click a page** to open its full results in the normal one-page view, with the page preview, HTML source, Links tab and link checking. **← Back to list** returns to the table, and the list and its results are kept while you switch between views.
+
 ## Links on the page
 
 After a scan, the results area has two tabs, **WCAG results** and **Links (N)**. The **Links** tab lists every link on the page in page order, showing each link's text and address. **Click a link to see where it is:** the page preview scrolls to it and outlines it, with a caption giving its text and address, and the HTML source jumps to its tag.
@@ -150,6 +168,14 @@ How links are checked:
   - **Click a row** to open a details pane that lists every column of that row in full. You can select and copy the text.
     - Use **Dock: Below | Right | Left** in the pane's header to choose where it appears, like a browser's developer tools. Drag the pane's edge to resize it.
     - The app remembers your choice and uses the same side next time, including after a restart. It's saved as soon as you change it, in `~/Library/Application Support/ADA-Checker/app.ron`. Only this setting is stored there.
+
+### Closing the spreadsheet
+
+**Close spreadsheet**, at the right of the tab bar, closes the open file and returns to the **Open file** tab.
+
+- **Changes already saved automatically:** the file closes straight away. A note you were still typing is saved first.
+- **Changes never saved** (you chose **Not now**): you're asked whether to save them to the `-fixed` copy first, close without saving, or cancel.
+- A closed spreadsheet is forgotten, so **Reopen the last spreadsheet** won't open it at the next launch. The next spreadsheet you open becomes the one to reopen.
 
 ### Reopening the last spreadsheet
 

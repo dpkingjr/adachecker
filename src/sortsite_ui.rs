@@ -128,6 +128,8 @@ pub struct SortsiteEval {
     last_file: Option<PathBuf>,
     /// The toggle or last file changed; the app saves its settings.
     settings_changed: bool,
+    /// "Close without saving?" is being asked.
+    show_close_prompt: bool,
     /// Why the last spreadsheet couldn't be reopened at startup.
     reopen_note: Option<String>,
     /// Whether the file being opened / currently open should be remembered as the last one
@@ -655,6 +657,98 @@ impl SortsiteEval {
         self.workbook.as_ref().map(|wb| xlsx_edit::fixed_path(&wb.path))
     }
 
+    /// "Close spreadsheet": closes now, unless there are changes that won't otherwise be
+    /// saved — then asks first. With automatic saving on, a note still waiting for its
+    /// typing pause is saved before closing.
+    fn request_close(&mut self, ctx: &egui::Context) {
+        if self.workbook.is_none() {
+            return;
+        }
+        if self.autosave && self.note_pending.is_some() {
+            self.start_save(ctx);
+        }
+        if self.unsaved && !self.autosave {
+            self.show_close_prompt = true;
+        } else {
+            self.close_workbook();
+        }
+    }
+
+    /// Closes the open spreadsheet and resets the pane. A save already running finishes on
+    /// its own. The file is forgotten as "last spreadsheet", so it isn't reopened next launch.
+    fn close_workbook(&mut self) {
+        if self.last_file.take().is_some() {
+            self.settings_changed = true;
+        }
+        self.workbook = None;
+        self.loading = None;
+        self.error = None;
+        self.statuses.clear();
+        self.notes.clear();
+        self.notes_rev += 1;
+        self.note_pending = None;
+        self.note_focus_lost = false;
+        self.link_checks.clear();
+        self.selected = 0;
+        self.selected_row = None;
+        self.filter.clear();
+        self.sort = None;
+        self.view_cache = None;
+        self.asked_to_save = false;
+        self.autosave = false;
+        self.show_save_prompt = false;
+        self.show_close_prompt = false;
+        self.unsaved = false;
+        self.saving = None;
+        self.save_again = false;
+        self.last_save = None;
+        self.remember_current = false;
+        self.ada_check_request = None;
+        self.tab = Tab::File;
+    }
+
+    /// "Close without saving?" — shown when closing with changes that were never saved.
+    fn close_prompt(&mut self, ctx: &egui::Context) {
+        if !self.show_close_prompt {
+            return;
+        }
+        let (Some(wb), Some(target)) = (self.workbook.clone(), self.save_target()) else {
+            self.show_close_prompt = false;
+            return;
+        };
+        let target_name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let can_save = wb.original.is_some();
+        let (mut save, mut discard, mut cancel) = (false, false, false);
+        let modal = egui::Modal::new(egui::Id::unique("sortsite-close-prompt")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("Close without saving?");
+            ui.add_space(6.0);
+            ui.label(format!("Your status and note changes to “{}” haven't been saved.", wb.file_name()));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if can_save && ui.button(RichText::new(format!("Save as {target_name} and close")).strong()).clicked() {
+                    save = true;
+                }
+                if ui.button("Close without saving").clicked() {
+                    discard = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if save {
+            // The save runs in the background with its own copy of the changes.
+            self.autosave = true;
+            self.start_save(ctx);
+            self.close_workbook();
+        } else if discard {
+            self.close_workbook();
+        } else if cancel || modal.should_close() {
+            self.show_close_prompt = false;
+        }
+    }
+
     fn accept_save(&mut self, ctx: &egui::Context) {
         self.show_save_prompt = false;
         self.autosave = true;
@@ -955,8 +1049,10 @@ impl SortsiteEval {
     /// "Open file" and "Worksheets", both inside the main window.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.save_prompt(&ui.ctx().clone());
+        self.close_prompt(&ui.ctx().clone());
         let wb = self.workbook.clone();
         let tab = if wb.is_some() { self.tab } else { Tab::File };
+        let mut close_clicked = false;
         egui::Panel::top("sortsite-tabs").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -973,15 +1069,22 @@ impl SortsiteEval {
                         .on_disabled_hover_text("Open a spreadsheet first")
                         .clicked()
                     {
-                        if let Some((col, ascending)) = self.debug_sort.take() {
-                            self.sort = Some((SortBy::Column(col), ascending));
-                        }
                         self.tab = Tab::Sheets;
                     }
                 });
+                if wb.is_some() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close spreadsheet").on_hover_text("Close this spreadsheet (your saved changes stay in its file)").clicked() {
+                            close_clicked = true;
+                        }
+                    });
+                }
             });
             ui.add_space(4.0);
         });
+        if close_clicked {
+            self.request_close(ui.ctx());
+        }
         match (tab, wb) {
             (Tab::Sheets, Some(wb)) => {
                 egui::Panel::left("sheet-list")
@@ -1735,6 +1838,51 @@ mod tests {
         assert_eq!(sorted(SortBy::Column(1), false), [1, 3, 4, 2], "10, 9, 9, empty still last");
         assert_eq!(sorted(SortBy::Column(0), true), [2, 4, 1, 3], "a, a, b, c (stable)");
         assert_eq!(sorted(SortBy::Row, false), [4, 3, 2, 1]);
+    }
+
+    fn open_workbook(s: &mut SortsiteEval) {
+        let sheet = sheet_of(&[&["Guidelines", "URL"], &["Broken Link", "https://x/"]]);
+        s.workbook = Some(Arc::new(Workbook {
+            path: "/d/ada.xlsx".into(),
+            sheets: vec![sheet],
+            original: Some(Arc::new(Vec::new())),
+            saved_statuses: Statuses::new(),
+        }));
+        s.tab = Tab::Sheets;
+    }
+
+    #[test]
+    fn closing_resets_the_pane() {
+        let ctx = egui::Context::default();
+        let mut s = SortsiteEval::default();
+        open_workbook(&mut s);
+        s.statuses.insert("s".into(), [(2, Status::Fixed)].into_iter().collect());
+        s.filter = "broken".into();
+        s.selected_row = Some(1);
+        s.last_file = Some("/d/ada.xlsx".into());
+        s.request_close(&ctx);
+        assert!(s.workbook.is_none() && s.statuses.is_empty() && s.filter.is_empty() && s.selected_row.is_none());
+        assert!(s.tab == Tab::File, "back to the Open file tab");
+        assert!(s.last_file.is_none(), "a closed spreadsheet isn't reopened next launch");
+        assert!(s.take_settings_changed(), "and that is saved to the settings file");
+    }
+
+    #[test]
+    fn closing_with_unsaved_changes_asks_first() {
+        let ctx = egui::Context::default();
+        let mut s = SortsiteEval::default();
+        open_workbook(&mut s);
+        s.unsaved = true; // the user chose "Not now"
+        s.request_close(&ctx);
+        assert!(s.show_close_prompt, "asks before discarding");
+        assert!(s.workbook.is_some(), "nothing closed yet");
+
+        let mut auto = SortsiteEval::default();
+        open_workbook(&mut auto);
+        auto.autosave = true;
+        auto.unsaved = false;
+        auto.request_close(&ctx);
+        assert!(auto.workbook.is_none(), "already saved automatically: closes straight away");
     }
 
     #[test]
